@@ -768,6 +768,7 @@ def convert_automations(export_data, entity_lookup):
     automations = []
     classifications = []
     entity_match_stats = {}  # reason -> count
+    source_pairs = []  # [(hk_auto, ha_auto, classification, reasons), ...]
 
     # Wrap entity_lookup to track match stats
     def tracked_lookup(name, room, service):
@@ -803,11 +804,172 @@ def convert_automations(export_data, entity_lookup):
         }
 
         automations.append(ha_auto)
-        classifications.append(classify_automation(ha_auto))
+        cls, reasons = classify_automation(ha_auto)
+        classifications.append((cls, reasons))
+        source_pairs.append((auto, ha_auto, cls, reasons))
 
     audit = build_audit_report(automations, classifications)
     audit["entity_match_stats"] = entity_match_stats
+    audit["_source_pairs"] = source_pairs  # For simulate mode
     return automations, audit
+
+
+# ============ SIMULATE / PREVIEW ============
+
+def _summarize_hk_trigger(auto):
+    """Produce a one-line summary of a HomeKit automation's trigger."""
+    trigger_type = auto.get("triggerType", "")
+    name = auto.get("name", "")
+    events = auto.get("events", [])
+
+    if trigger_type == "timer":
+        return f"Timer (name hint: '{name}')"
+
+    parts = []
+    for evt in events:
+        et = evt.get("eventType", "")
+        if et == "significantTime":
+            sig = evt.get("significantEvent", "?")
+            offset = evt.get("offsetSeconds", 0)
+            s = sig
+            if offset:
+                s += f" +{offset}s" if offset > 0 else f" {offset}s"
+            parts.append(s)
+        elif et == "charValue":
+            char = evt.get("characteristic", "?")
+            acc = evt.get("accessory", "?")
+            val = evt.get("eventValue", "?")
+            parts.append(f"{acc}: {char} = {val}")
+        elif et == "presence":
+            parts.append("Presence change")
+        else:
+            parts.append(f"{et}")
+
+    return "; ".join(parts) if parts else f"Unknown ({trigger_type})"
+
+
+def _summarize_hk_actions(auto):
+    """Produce a list of one-line summaries of HomeKit actions."""
+    lines = []
+    for aset in auto.get("actionSets", []):
+        for action in aset.get("actions", []):
+            at = action.get("actionType", "")
+            if at == "characteristicWrite":
+                acc = action.get("accessoryName", "?")
+                char = action.get("characteristic", "?")
+                val = action.get("targetValue", "?")
+                svc = action.get("serviceName", "")
+                lines.append(f"Set {acc} ({svc}) {char} = {val}")
+            elif at == "shortcut":
+                steps = action.get("workflowSteps", [])
+                if steps:
+                    step_types = [s.get("type", "?") for s in steps]
+                    lines.append(f"Shortcut workflow: {len(steps)} steps ({', '.join(set(step_types))})")
+                else:
+                    lines.append("Shortcut (opaque, no workflow data)")
+            else:
+                lines.append(f"{at}")
+    return lines if lines else ["(no actions)"]
+
+
+def _summarize_ha_trigger(ha_auto):
+    """One-line summary of the converted HA trigger."""
+    triggers = ha_auto.get("triggers", [])
+    if not triggers:
+        return "(no trigger)"
+    parts = []
+    for t in triggers:
+        plat = t.get("platform", "?")
+        if plat == "time":
+            parts.append(f"time: {t.get('at', '?')}")
+        elif plat == "sun":
+            parts.append(f"sun: {t.get('event', '?')}")
+        elif plat == "event":
+            et = t.get("event_type", "?")
+            if et == "manual_trigger_needed":
+                parts.append("PLACEHOLDER (needs manual config)")
+            else:
+                data = t.get("event_data", {})
+                parts.append(f"event: {data.get('device_name', '?')} {data.get('action', '')}")
+        elif plat == "state":
+            parts.append(f"state: {t.get('entity_id', '?')} -> {t.get('to', '?')}")
+        else:
+            parts.append(f"{plat}")
+    return "; ".join(parts)
+
+
+def _summarize_ha_actions(ha_auto):
+    """List of one-line summaries of converted HA actions."""
+    lines = []
+    for a in ha_auto.get("actions", []):
+        if "_comment" in a and len(a) == 1:
+            lines.append(f"  TODO: {a['_comment']}")
+        elif "choose" in a:
+            branches = len(a.get("choose", []))
+            has_default = "default" in a
+            lines.append(f"  choose ({branches} branch{'es' if branches != 1 else ''}"
+                         f"{' + default' if has_default else ''})")
+        elif "service" in a:
+            svc = a["service"]
+            target = a.get("target", {}).get("entity_id", "")
+            data = a.get("data", {})
+            data_str = f" {data}" if data else ""
+            lines.append(f"  {svc} -> {target}{data_str}")
+        else:
+            lines.append(f"  (unknown action)")
+    return lines if lines else ["  (no actions)"]
+
+
+def simulate_output(audit, file=sys.stderr):
+    """Print a human-readable simulation report showing source vs. converted."""
+    pairs = audit.get("_source_pairs", [])
+    if not pairs:
+        print("No automations to simulate.", file=file)
+        return
+
+    for i, (hk_auto, ha_auto, cls, reasons) in enumerate(pairs, 1):
+        name = hk_auto.get("name", "Unknown")
+        enabled = hk_auto.get("enabled", True)
+
+        print(f"\n{'='*70}", file=file)
+        print(f"  [{i}/{len(pairs)}] {name}", file=file)
+        print(f"  Enabled: {'Yes' if enabled else 'No'}    "
+              f"Classification: {cls}", file=file)
+        if reasons:
+            print(f"  Reasons: {', '.join(reasons)}", file=file)
+        print(f"{'='*70}", file=file)
+
+        # HomeKit source
+        print(f"\n  HOMEKIT SOURCE:", file=file)
+        print(f"    Trigger: {_summarize_hk_trigger(hk_auto)}", file=file)
+        print(f"    Actions:", file=file)
+        for line in _summarize_hk_actions(hk_auto):
+            print(f"      {line}", file=file)
+
+        # HA conversion
+        print(f"\n  HOME ASSISTANT CONVERSION:", file=file)
+        print(f"    Trigger: {_summarize_ha_trigger(ha_auto)}", file=file)
+        print(f"    Actions:", file=file)
+        for line in _summarize_ha_actions(ha_auto):
+            print(f"    {line}", file=file)
+
+        # Risk summary
+        todo_count = str(ha_auto).count("TODO")
+        if cls == CLASSIFY_READY:
+            risk = "LOW — no TODOs, verify entity mappings then import"
+        elif cls == CLASSIFY_PARTIAL:
+            risk = f"MEDIUM — {todo_count} TODOs need fixing before import"
+        else:
+            risk = f"HIGH — {todo_count} TODOs, needs manual rebuild"
+        print(f"\n  RISK: {risk}", file=file)
+
+    print(f"\n{'='*70}", file=file)
+    s = audit["summary"]
+    print(f"  SIMULATION COMPLETE: {s['total']} automations reviewed", file=file)
+    print(f"  {s[CLASSIFY_READY]:3d} READY_TO_TEST  |  "
+          f"{s[CLASSIFY_PARTIAL]:3d} REVIEW_REQUIRED  |  "
+          f"{s[CLASSIFY_MANUAL]:3d} MANUAL_REBUILD", file=file)
+    print(f"{'='*70}\n", file=file)
 
 
 def to_yaml(automations):
@@ -936,6 +1098,12 @@ def main():
         help="Exit nonzero if any automation is MANUAL_REBUILD or has AMBIGUOUS_ENTITY",
     )
     parser.add_argument(
+        "--simulate",
+        action="store_true",
+        help="Preview mode: show side-by-side HomeKit source vs. HA conversion "
+             "for each automation, without writing YAML output",
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Print detailed conversion statistics",
@@ -965,15 +1133,19 @@ def main():
     # Convert
     automations, audit = convert_automations(export_data, entity_lookup)
 
-    # Output
-    yaml_output = to_yaml(automations)
-
-    if args.output:
-        with open(args.output, "w", encoding="utf-8") as f:
-            f.write(yaml_output)
-        print(f"Written {len(automations)} automations to {args.output}", file=sys.stderr)
+    # Simulate mode: show side-by-side preview and skip YAML output
+    if args.simulate:
+        simulate_output(audit)
     else:
-        print(yaml_output)
+        # Normal mode: produce YAML output
+        yaml_output = to_yaml(automations)
+
+        if args.output:
+            with open(args.output, "w", encoding="utf-8") as f:
+                f.write(yaml_output)
+            print(f"Written {len(automations)} automations to {args.output}", file=sys.stderr)
+        else:
+            print(yaml_output)
 
     # Audit report
     s = audit["summary"]
@@ -1022,8 +1194,32 @@ def main():
 
     # Write audit JSON if requested
     if args.audit_json:
+        # Enrich with per-automation source-vs-converted comparison
+        audit_out = {k: v for k, v in audit.items() if k != "_source_pairs"}
+        source_pairs = audit.get("_source_pairs", [])
+        if source_pairs:
+            comparisons = []
+            for hk_auto, ha_auto, cls, reasons in source_pairs:
+                comparisons.append({
+                    "name": hk_auto.get("name", "Unknown"),
+                    "classification": cls,
+                    "reasons": reasons,
+                    "homekit": {
+                        "trigger": _summarize_hk_trigger(hk_auto),
+                        "actions": _summarize_hk_actions(hk_auto),
+                        "enabled": hk_auto.get("enabled", True),
+                    },
+                    "home_assistant": {
+                        "trigger": _summarize_ha_trigger(ha_auto),
+                        "actions": _summarize_ha_actions(ha_auto),
+                        "alias": ha_auto.get("alias", ""),
+                        "id": ha_auto.get("id", ""),
+                    },
+                })
+            audit_out["comparisons"] = comparisons
+
         with open(args.audit_json, "w", encoding="utf-8") as f:
-            json.dump(audit, f, indent=2, ensure_ascii=False)
+            json.dump(audit_out, f, indent=2, ensure_ascii=False)
         print(f"\nAudit report written to: {args.audit_json}", file=sys.stderr)
 
     # Strict mode: fail if any automation is MANUAL_REBUILD or AMBIGUOUS_ENTITY

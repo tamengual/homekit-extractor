@@ -23,6 +23,11 @@ from homekit_to_ha import (
     build_audit_report,
     find_entity,
     convert_automations,
+    _summarize_hk_trigger,
+    _summarize_hk_actions,
+    _summarize_ha_trigger,
+    _summarize_ha_actions,
+    simulate_output,
 )
 
 
@@ -533,6 +538,249 @@ class TestEndToEnd(unittest.TestCase):
             for entry in audit[bucket]:
                 all_names_in_audit.add(entry["name"])
         self.assertEqual(len(all_names_in_audit), 5)
+
+
+class TestSimulateHelpers(unittest.TestCase):
+    """Test the simulate/preview helper functions."""
+
+    def test_summarize_hk_trigger_timer(self):
+        auto = {"name": "10 00 PM, Daily", "triggerType": "timer", "events": []}
+        result = _summarize_hk_trigger(auto)
+        self.assertIn("Timer", result)
+        self.assertIn("10 00 PM", result)
+
+    def test_summarize_hk_trigger_significant_time(self):
+        auto = {
+            "name": "Sunrise",
+            "triggerType": "event",
+            "events": [{"eventType": "significantTime", "significantEvent": "sunrise", "offsetSeconds": 1800}],
+        }
+        result = _summarize_hk_trigger(auto)
+        self.assertIn("sunrise", result)
+        self.assertIn("+1800s", result)
+
+    def test_summarize_hk_trigger_char_value(self):
+        auto = {
+            "name": "Motion",
+            "triggerType": "event",
+            "events": [{"eventType": "charValue", "characteristic": "Motion Detected",
+                         "accessory": "Front Door Camera", "eventValue": True}],
+        }
+        result = _summarize_hk_trigger(auto)
+        self.assertIn("Front Door Camera", result)
+        self.assertIn("Motion Detected", result)
+
+    def test_summarize_hk_actions_characteristic_write(self):
+        auto = {
+            "actionSets": [{
+                "actions": [{
+                    "actionType": "characteristicWrite",
+                    "accessoryName": "Living Room Light",
+                    "serviceName": "Lightbulb",
+                    "characteristic": "Power State",
+                    "targetValue": False,
+                }]
+            }]
+        }
+        lines = _summarize_hk_actions(auto)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("Living Room Light", lines[0])
+        self.assertIn("Power State", lines[0])
+
+    def test_summarize_hk_actions_shortcut_opaque(self):
+        auto = {
+            "actionSets": [{
+                "actions": [{"actionType": "shortcut"}]
+            }]
+        }
+        lines = _summarize_hk_actions(auto)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("Shortcut", lines[0])
+
+    def test_summarize_hk_actions_empty(self):
+        auto = {"actionSets": [{"actions": []}]}
+        lines = _summarize_hk_actions(auto)
+        self.assertEqual(lines, ["(no actions)"])
+
+    def test_summarize_ha_trigger_time(self):
+        ha_auto = {"triggers": [{"platform": "time", "at": "22:00:00"}]}
+        result = _summarize_ha_trigger(ha_auto)
+        self.assertIn("time", result)
+        self.assertIn("22:00:00", result)
+
+    def test_summarize_ha_trigger_sun(self):
+        ha_auto = {"triggers": [{"platform": "sun", "event": "sunrise"}]}
+        result = _summarize_ha_trigger(ha_auto)
+        self.assertIn("sun", result)
+        self.assertIn("sunrise", result)
+
+    def test_summarize_ha_trigger_placeholder(self):
+        ha_auto = {"triggers": [{"platform": "event", "event_type": "manual_trigger_needed"}]}
+        result = _summarize_ha_trigger(ha_auto)
+        self.assertIn("PLACEHOLDER", result)
+
+    def test_summarize_ha_trigger_empty(self):
+        ha_auto = {"triggers": []}
+        result = _summarize_ha_trigger(ha_auto)
+        self.assertEqual(result, "(no trigger)")
+
+    def test_summarize_ha_actions_service(self):
+        ha_auto = {
+            "actions": [
+                {"service": "light.turn_on", "target": {"entity_id": "light.kitchen"}, "data": {}},
+            ]
+        }
+        lines = _summarize_ha_actions(ha_auto)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("light.turn_on", lines[0])
+        self.assertIn("light.kitchen", lines[0])
+
+    def test_summarize_ha_actions_todo(self):
+        ha_auto = {
+            "actions": [
+                {"_comment": "# TODO: Unsupported action type: shortcut"},
+            ]
+        }
+        lines = _summarize_ha_actions(ha_auto)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("TODO", lines[0])
+
+    def test_summarize_ha_actions_choose(self):
+        ha_auto = {
+            "actions": [
+                {"choose": [{"conditions": [], "sequence": []}], "default": []},
+            ]
+        }
+        lines = _summarize_ha_actions(ha_auto)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("choose", lines[0])
+        self.assertIn("default", lines[0])
+
+    def test_summarize_ha_actions_empty(self):
+        ha_auto = {"actions": []}
+        lines = _summarize_ha_actions(ha_auto)
+        self.assertEqual(lines, ["  (no actions)"])
+
+
+class TestSimulateOutput(unittest.TestCase):
+    """Test the full simulate_output function."""
+
+    def test_simulate_output_produces_output(self):
+        """simulate_output should write a formatted report to the given file."""
+        import io
+        audit = {
+            "summary": {
+                "total": 2,
+                CLASSIFY_READY: 1,
+                CLASSIFY_PARTIAL: 1,
+                CLASSIFY_MANUAL: 0,
+            },
+            "_source_pairs": [
+                (
+                    # HomeKit source
+                    {"name": "Living Room Off", "enabled": True, "triggerType": "timer",
+                     "events": [],
+                     "actionSets": [{"actions": [{"actionType": "characteristicWrite",
+                      "accessoryName": "Living Room Light", "serviceName": "Lightbulb",
+                      "characteristic": "Power State", "targetValue": False}]}]},
+                    # HA converted
+                    {"triggers": [{"platform": "time", "at": "23:00:00"}],
+                     "actions": [{"service": "light.turn_off",
+                      "target": {"entity_id": "light.living_room"}}]},
+                    CLASSIFY_READY, [],
+                ),
+                (
+                    # HomeKit source (shortcut)
+                    {"name": "Button Shortcut", "enabled": True, "triggerType": "event",
+                     "events": [{"eventType": "charValue", "characteristic": "Programmable Switch Event",
+                      "accessory": "Bedroom Button", "eventValue": 0}],
+                     "actionSets": [{"actions": [{"actionType": "shortcut"}]}]},
+                    # HA converted (with TODO)
+                    {"triggers": [{"platform": "event", "event_type": "homekit_button_press",
+                     "event_data": {"device_name": "Bedroom Button", "action": "single_press"}}],
+                     "actions": [{"_comment": "# TODO: Unsupported action type: shortcut"}]},
+                    CLASSIFY_PARTIAL, ["TODO_ACTION"],
+                ),
+            ],
+        }
+
+        buf = io.StringIO()
+        simulate_output(audit, file=buf)
+        output = buf.getvalue()
+
+        # Should contain both automation names
+        self.assertIn("Living Room Off", output)
+        self.assertIn("Button Shortcut", output)
+
+        # Should contain classification labels
+        self.assertIn("READY_TO_TEST", output)
+        self.assertIn("REVIEW_REQUIRED", output)
+
+        # Should contain source and converted sections
+        self.assertIn("HOMEKIT SOURCE", output)
+        self.assertIn("HOME ASSISTANT CONVERSION", output)
+
+        # Should contain risk assessment
+        self.assertIn("RISK", output)
+
+        # Should contain simulation summary
+        self.assertIn("SIMULATION COMPLETE", output)
+        self.assertIn("2 automations reviewed", output)
+
+    def test_simulate_empty_pairs(self):
+        """simulate_output with no source pairs should print a message."""
+        import io
+        audit = {"_source_pairs": []}
+        buf = io.StringIO()
+        simulate_output(audit, file=buf)
+        self.assertIn("No automations to simulate", buf.getvalue())
+
+    def test_simulate_disabled_automation(self):
+        """Disabled automations should show Enabled: No."""
+        import io
+        audit = {
+            "summary": {"total": 1, CLASSIFY_READY: 1, CLASSIFY_PARTIAL: 0, CLASSIFY_MANUAL: 0},
+            "_source_pairs": [
+                (
+                    {"name": "Disabled Auto", "enabled": False, "triggerType": "timer",
+                     "events": [],
+                     "actionSets": [{"actions": [{"actionType": "characteristicWrite",
+                      "accessoryName": "Light", "serviceName": "Lightbulb",
+                      "characteristic": "Power State", "targetValue": True}]}]},
+                    {"triggers": [{"platform": "time", "at": "08:00:00"}],
+                     "actions": [{"service": "light.turn_on",
+                      "target": {"entity_id": "light.bedroom"}}]},
+                    CLASSIFY_READY, [],
+                ),
+            ],
+        }
+        buf = io.StringIO()
+        simulate_output(audit, file=buf)
+        self.assertIn("Enabled: No", buf.getvalue())
+
+    def test_simulate_reasons_shown(self):
+        """Reason codes should be displayed in the simulation output."""
+        import io
+        audit = {
+            "summary": {"total": 1, CLASSIFY_READY: 0, CLASSIFY_PARTIAL: 0, CLASSIFY_MANUAL: 1},
+            "_source_pairs": [
+                (
+                    {"name": "Bad Auto", "enabled": True, "triggerType": "timer",
+                     "events": [],
+                     "actionSets": [{"actions": [{"actionType": "shortcut"}]}]},
+                    {"triggers": [{"platform": "event", "event_type": "manual_trigger_needed",
+                     "_comment": "# TODO: Configure trigger"}],
+                     "actions": [{"_comment": "# TODO: Unsupported action type: shortcut"}]},
+                    CLASSIFY_MANUAL, ["PLACEHOLDER_TRIGGER", "ALL_TODO_ACTIONS"],
+                ),
+            ],
+        }
+        buf = io.StringIO()
+        simulate_output(audit, file=buf)
+        output = buf.getvalue()
+        self.assertIn("PLACEHOLDER_TRIGGER", output)
+        self.assertIn("ALL_TODO_ACTIONS", output)
+        self.assertIn("HIGH", output)  # Risk should be HIGH
 
 
 if __name__ == "__main__":

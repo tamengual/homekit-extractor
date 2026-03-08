@@ -38,7 +38,8 @@ Python scripts that combine both exports and produce Home Assistant automation Y
 - Characteristic-to-service-call translation (brightness, color, temperature, etc.)
 - Conditional logic preservation (toggle patterns, if/else branches)
 - Audit report classifying each automation as `READY_TO_TEST` / `REVIEW_REQUIRED` / `MANUAL_REBUILD` with reason codes
-- Structured JSON audit output (`--audit-json`) for tooling and debugging
+- Structured JSON audit output (`--audit-json`) for tooling and debugging, including per-automation source-vs-converted comparisons
+- Simulation/preview mode (`--simulate`) that shows a side-by-side comparison of each HomeKit source automation and its HA conversion, with risk assessment, without writing any YAML output
 - Strict mode (`--strict`) that exits nonzero on ambiguous entities or unresolvable automations
 
 ## Quick Start
@@ -95,6 +96,8 @@ python3 homekit_to_ha.py \
 > fail the conversion if any entity mapping is ambiguous.  **Do not disable
 > HomeKit until you've verified every converted automation works in HA.**
 >
+> Use `--simulate` to preview the conversion before writing YAML — it shows each
+> automation's HomeKit source alongside the HA conversion with risk assessment.
 > Use `--audit-json audit.json` to get a machine-readable report for scripting
 > or building a second-pass fixer.
 
