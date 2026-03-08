@@ -153,57 +153,84 @@ def build_entity_map_from_registry(registry_path):
     return entity_by_name, entity_by_normalized, all_entities
 
 
-def find_entity(accessory_name, room_name, service_name, entity_by_name, entity_by_normalized, all_entities):
+def find_entity(accessory_name, room_name, service_name, entity_by_name,
+                entity_by_normalized, all_entities):
     """Find the best matching HA entity_id for a HomeKit accessory.
 
-    Tries multiple strategies in order of confidence.
+    Tries multiple strategies in order of confidence.  Returns a tuple of
+    (entity_id, match_reason) where match_reason is one of:
+
+        EXACT_NAME          — accessory name matched an HA entity name exactly
+        NORMALIZED_NAME     — matched after lowercasing and stripping punctuation
+        SERVICE_NAME        — matched using the HomeKit service name
+        ROOM_PLUS_SERVICE   — matched after stripping the room prefix
+        SUBSTRING           — one name is a substring of the other
+        FUZZY_<score>       — fuzzy SequenceMatcher ratio (e.g. FUZZY_0.82)
+        AMBIGUOUS_ENTITY    — multiple candidates scored too close; refused
+        UNMATCHED           — no plausible match found
+        NO_NAME             — accessory had no name to match on
     """
     if not accessory_name:
-        return None, "no_name"
+        return None, "NO_NAME"
 
-    # Strategy 1: Exact name match
+    # Strategy 1: Exact name match (highest confidence)
     if accessory_name in entity_by_name:
-        return entity_by_name[accessory_name], "exact"
+        return entity_by_name[accessory_name], "EXACT_NAME"
 
     # Strategy 2: Normalized match
     normalized = re.sub(r"[^a-z0-9 ]", "", accessory_name.lower()).strip()
     if normalized in entity_by_normalized:
-        return entity_by_normalized[normalized], "normalized"
+        return entity_by_normalized[normalized], "NORMALIZED_NAME"
 
     # Strategy 3: Try with service name
     if service_name and service_name != accessory_name:
         if service_name in entity_by_name:
-            return entity_by_name[service_name], "service_name"
+            return entity_by_name[service_name], "SERVICE_NAME"
         svc_norm = re.sub(r"[^a-z0-9 ]", "", service_name.lower()).strip()
         if svc_norm in entity_by_normalized:
-            return entity_by_normalized[svc_norm], "service_normalized"
+            return entity_by_normalized[svc_norm], "SERVICE_NAME"
 
-    # Strategy 4: Substring match
-    for ent in all_entities:
-        if normalized in ent["normalized"] or ent["normalized"] in normalized:
-            return ent["entity_id"], "substring"
-
-    # Strategy 5: Fuzzy match
-    best_score = 0
-    best_match = None
-    for ent in all_entities:
-        score = SequenceMatcher(None, normalized, ent["normalized"]).ratio()
-        if score > best_score:
-            best_score = score
-            best_match = ent["entity_id"]
-
-    if best_score > 0.6:
-        return best_match, f"fuzzy_{best_score:.2f}"
-
-    # Strategy 6: Try stripping room prefix
+    # Strategy 4: Try stripping room prefix (before fuzzy, since it's more
+    # intentional than a fuzzy guess)
     if room_name:
         stripped = accessory_name.replace(room_name, "").strip()
         if stripped:
             stripped_norm = re.sub(r"[^a-z0-9 ]", "", stripped.lower()).strip()
             if stripped_norm in entity_by_normalized:
-                return entity_by_normalized[stripped_norm], "room_stripped"
+                return entity_by_normalized[stripped_norm], "ROOM_PLUS_SERVICE"
 
-    return None, "unmatched"
+    # Strategy 5: Substring match — but check for ambiguity first
+    substring_matches = []
+    for ent in all_entities:
+        if normalized and (normalized in ent["normalized"] or ent["normalized"] in normalized):
+            substring_matches.append(ent)
+
+    if len(substring_matches) == 1:
+        return substring_matches[0]["entity_id"], "SUBSTRING"
+    elif len(substring_matches) > 1:
+        # Multiple substring matches — ambiguous
+        return None, "AMBIGUOUS_ENTITY"
+
+    # Strategy 6: Fuzzy match — score all candidates, check for ambiguity
+    scored = []
+    for ent in all_entities:
+        score = SequenceMatcher(None, normalized, ent["normalized"]).ratio()
+        if score > 0.6:
+            scored.append((ent["entity_id"], ent["name"], score))
+
+    if scored:
+        scored.sort(key=lambda x: x[2], reverse=True)
+        best_id, best_name, best_score = scored[0]
+
+        # Check for ambiguity: if second-best is within 0.08 of best, refuse
+        if len(scored) >= 2:
+            second_score = scored[1][2]
+            if best_score - second_score < 0.08:
+                return None, "AMBIGUOUS_ENTITY"
+
+        return best_id, f"FUZZY_{best_score:.2f}"
+
+    return None, "UNMATCHED"
 
 
 # ============ TRIGGER CONVERSION ============
@@ -614,64 +641,118 @@ def build_choose_block(steps, start_idx, entity_lookup):
 
 # ============ AUDIT CLASSIFICATION ============
 
+# Classification labels — intentionally explicit about what they mean.
+CLASSIFY_READY = "READY_TO_TEST"
+CLASSIFY_PARTIAL = "REVIEW_REQUIRED"
+CLASSIFY_MANUAL = "MANUAL_REBUILD"
+
+
 def classify_automation(ha_auto):
     """Classify a converted automation's readiness level.
 
-    Returns one of:
-        "ready"   — No TODOs, has real trigger and actions. Can be imported.
-        "partial" — Has some real actions but also TODOs that need fixing.
-        "manual"  — Trigger is placeholder or all actions are TODOs. Needs
-                     significant manual work before it will function.
+    Returns a tuple of (classification, reasons) where classification is one of:
+
+        "READY_TO_TEST"      — No TODOs, has real trigger and actions.
+                               Still needs human verification before trusting.
+        "REVIEW_REQUIRED"    — Has some real actions but also TODOs that need
+                               fixing before the automation will work correctly.
+        "MANUAL_REBUILD"     — Trigger is placeholder or all actions are TODOs.
+                               Needs significant manual work.
+
+    The reasons list contains zero or more codes explaining *why* the
+    automation was classified this way (useful for structured audit output):
+
+        PLACEHOLDER_TRIGGER      — trigger is a manual_trigger_needed placeholder
+        TODO_ACTION              — one or more actions contain TODO markers
+        ALL_TODO_ACTIONS         — every action is a TODO (no real service calls)
+        AMBIGUOUS_ENTITY         — entity mapping was refused due to ambiguity
+        UNKNOWN_CHARACTERISTIC   — unknown HomeKit characteristic encountered
+        UNSUPPORTED_SHORTCUT_STEP — shortcut workflow step not handled
     """
     yaml_str = str(ha_auto)
     todo_count = yaml_str.count("TODO")
+    reasons = []
+
     has_placeholder_trigger = "manual_trigger_needed" in yaml_str
+    if has_placeholder_trigger:
+        reasons.append("PLACEHOLDER_TRIGGER")
+
+    has_ambiguous = "AMBIGUOUS_ENTITY" in yaml_str
+    if has_ambiguous:
+        reasons.append("AMBIGUOUS_ENTITY")
+
+    has_unknown_char = "Unknown characteristic" in yaml_str
+    if has_unknown_char:
+        reasons.append("UNKNOWN_CHARACTERISTIC")
+
+    has_unsupported_shortcut = "Unsupported action type" in yaml_str or "Menu action" in yaml_str
+    if has_unsupported_shortcut:
+        reasons.append("UNSUPPORTED_SHORTCUT_STEP")
+
     has_real_actions = any(
         isinstance(a, dict) and "service" in a and "TODO" not in str(a.get("service", ""))
         for a in ha_auto.get("actions", [])
     )
     has_real_trigger = not has_placeholder_trigger and ha_auto.get("triggers")
 
+    if not has_real_actions:
+        reasons.append("ALL_TODO_ACTIONS")
+    elif todo_count > 0:
+        reasons.append("TODO_ACTION")
+
     if todo_count == 0 and has_real_trigger and has_real_actions:
-        return "ready"
+        return CLASSIFY_READY, reasons
     elif has_real_actions and has_real_trigger:
-        return "partial"
+        return CLASSIFY_PARTIAL, reasons
     else:
-        return "manual"
+        return CLASSIFY_MANUAL, reasons
 
 
 def build_audit_report(automations, classifications):
     """Build a structured audit report of conversion quality.
 
+    Args:
+        automations: list of HA automation dicts
+        classifications: list of (classification, reasons) tuples
+
     Returns a dict with:
     - summary counts per classification
-    - lists of automation names per classification
+    - lists of automation entries per classification (with reason codes)
     - total TODO count
     """
     report = {
-        "ready": [],
-        "partial": [],
-        "manual": [],
+        CLASSIFY_READY: [],
+        CLASSIFY_PARTIAL: [],
+        CLASSIFY_MANUAL: [],
     }
 
     total_todos = 0
-    for auto, cls in zip(automations, classifications):
+    for auto, cls_tuple in zip(automations, classifications):
+        # Support both old-style string and new-style (string, reasons) tuple
+        if isinstance(cls_tuple, tuple):
+            cls, reasons = cls_tuple
+        else:
+            cls, reasons = cls_tuple, []
+
         name = auto.get("alias", auto.get("id", "unknown"))
         todo_count = str(auto).count("TODO")
         total_todos += todo_count
-        report[cls].append({"name": name, "todos": todo_count})
+        entry = {"name": name, "todos": todo_count}
+        if reasons:
+            entry["reasons"] = reasons
+        report[cls].append(entry)
 
     return {
         "summary": {
-            "ready": len(report["ready"]),
-            "partial": len(report["partial"]),
-            "manual": len(report["manual"]),
+            CLASSIFY_READY: len(report[CLASSIFY_READY]),
+            CLASSIFY_PARTIAL: len(report[CLASSIFY_PARTIAL]),
+            CLASSIFY_MANUAL: len(report[CLASSIFY_MANUAL]),
             "total": len(automations),
             "total_todos": total_todos,
         },
-        "ready": report["ready"],
-        "partial": report["partial"],
-        "manual": report["manual"],
+        CLASSIFY_READY: report[CLASSIFY_READY],
+        CLASSIFY_PARTIAL: report[CLASSIFY_PARTIAL],
+        CLASSIFY_MANUAL: report[CLASSIFY_MANUAL],
     }
 
 
@@ -686,6 +767,13 @@ def convert_automations(export_data, entity_lookup):
     """
     automations = []
     classifications = []
+    entity_match_stats = {}  # reason -> count
+
+    # Wrap entity_lookup to track match stats
+    def tracked_lookup(name, room, service):
+        entity_id, reason = entity_lookup(name, room, service)
+        entity_match_stats[reason] = entity_match_stats.get(reason, 0) + 1
+        return entity_id, reason
 
     for auto in export_data.get("automations", []):
         name = auto.get("name", "Unknown")
@@ -701,7 +789,7 @@ def convert_automations(export_data, entity_lookup):
         ha_actions = []
         for aset in auto.get("actionSets", []):
             for action in aset.get("actions", []):
-                ha_actions.extend(convert_action(action, entity_lookup))
+                ha_actions.extend(convert_action(action, tracked_lookup))
 
         # Build HA automation
         ha_auto = {
@@ -718,6 +806,7 @@ def convert_automations(export_data, entity_lookup):
         classifications.append(classify_automation(ha_auto))
 
     audit = build_audit_report(automations, classifications)
+    audit["entity_match_stats"] = entity_match_stats
     return automations, audit
 
 
@@ -838,6 +927,15 @@ def main():
         help="Output YAML file path (default: stdout)",
     )
     parser.add_argument(
+        "--audit-json",
+        help="Write structured audit report to this JSON file",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Exit nonzero if any automation is MANUAL_REBUILD or has AMBIGUOUS_ENTITY",
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Print detailed conversion statistics",
@@ -862,7 +960,7 @@ def main():
         print("Warning: No entity mapping provided. Entity IDs will be TODOs.", file=sys.stderr)
         def entity_lookup(name, room, service):
             entity_id = f"# TODO: Map entity for '{name}'"
-            return entity_id, "no_map"
+            return entity_id, "NO_MAP"
 
     # Convert
     automations, audit = convert_automations(export_data, entity_lookup)
@@ -879,34 +977,68 @@ def main():
 
     # Audit report
     s = audit["summary"]
+    n_ready = s[CLASSIFY_READY]
+    n_partial = s[CLASSIFY_PARTIAL]
+    n_manual = s[CLASSIFY_MANUAL]
     total_actions = sum(len(a.get("actions", [])) for a in automations)
+
     print(f"\n{'='*60}", file=sys.stderr)
     print(f"  CONVERSION AUDIT REPORT", file=sys.stderr)
     print(f"{'='*60}", file=sys.stderr)
-    print(f"  Total automations:  {s['total']}", file=sys.stderr)
+    print(f"  Total automations:   {s['total']}", file=sys.stderr)
     print(f"  Total action blocks: {total_actions}", file=sys.stderr)
-    print(f"  Total TODOs:        {s['total_todos']}", file=sys.stderr)
+    print(f"  Total TODOs:         {s['total_todos']}", file=sys.stderr)
     print(f"", file=sys.stderr)
-    print(f"  READY   ({s['ready']:3d})  No TODOs — can be imported directly", file=sys.stderr)
-    print(f"  PARTIAL ({s['partial']:3d})  Has real actions but some TODOs to fix", file=sys.stderr)
-    print(f"  MANUAL  ({s['manual']:3d})  Needs significant manual work", file=sys.stderr)
+    print(f"  READY_TO_TEST   ({n_ready:3d})  No TODOs detected — verify before importing", file=sys.stderr)
+    print(f"  REVIEW_REQUIRED ({n_partial:3d})  Has real actions but some TODOs to fix", file=sys.stderr)
+    print(f"  MANUAL_REBUILD  ({n_manual:3d})  Needs significant manual work", file=sys.stderr)
     print(f"{'='*60}", file=sys.stderr)
 
+    # Entity match statistics
+    if audit.get("entity_match_stats"):
+        print(f"\n--- Entity Matching ---", file=sys.stderr)
+        for reason, count in sorted(audit["entity_match_stats"].items(),
+                                     key=lambda x: -x[1]):
+            flag = " !!!" if reason in ("AMBIGUOUS_ENTITY", "UNMATCHED") else ""
+            print(f"  {reason:25s} {count:4d}{flag}", file=sys.stderr)
+
     if args.verbose:
-        if audit["ready"]:
-            print(f"\n--- READY (import as-is) ---", file=sys.stderr)
-            for a in audit["ready"]:
+        if audit[CLASSIFY_READY]:
+            print(f"\n--- READY_TO_TEST (verify then import) ---", file=sys.stderr)
+            for a in audit[CLASSIFY_READY]:
                 print(f"  {a['name']}", file=sys.stderr)
 
-        if audit["partial"]:
-            print(f"\n--- PARTIAL (fix TODOs first) ---", file=sys.stderr)
-            for a in audit["partial"]:
-                print(f"  {a['name']}  ({a['todos']} TODOs)", file=sys.stderr)
+        if audit[CLASSIFY_PARTIAL]:
+            print(f"\n--- REVIEW_REQUIRED (fix TODOs first) ---", file=sys.stderr)
+            for a in audit[CLASSIFY_PARTIAL]:
+                reasons = ", ".join(a.get("reasons", []))
+                print(f"  {a['name']}  ({a['todos']} TODOs) [{reasons}]", file=sys.stderr)
 
-        if audit["manual"]:
-            print(f"\n--- MANUAL (needs recreation) ---", file=sys.stderr)
-            for a in audit["manual"]:
-                print(f"  {a['name']}  ({a['todos']} TODOs)", file=sys.stderr)
+        if audit[CLASSIFY_MANUAL]:
+            print(f"\n--- MANUAL_REBUILD (needs recreation) ---", file=sys.stderr)
+            for a in audit[CLASSIFY_MANUAL]:
+                reasons = ", ".join(a.get("reasons", []))
+                print(f"  {a['name']}  ({a['todos']} TODOs) [{reasons}]", file=sys.stderr)
+
+    # Write audit JSON if requested
+    if args.audit_json:
+        with open(args.audit_json, "w", encoding="utf-8") as f:
+            json.dump(audit, f, indent=2, ensure_ascii=False)
+        print(f"\nAudit report written to: {args.audit_json}", file=sys.stderr)
+
+    # Strict mode: fail if any automation is MANUAL_REBUILD or AMBIGUOUS_ENTITY
+    if args.strict:
+        has_manual = n_manual > 0
+        has_ambiguous = audit.get("entity_match_stats", {}).get("AMBIGUOUS_ENTITY", 0) > 0
+        if has_manual or has_ambiguous:
+            issues = []
+            if has_manual:
+                issues.append(f"{n_manual} MANUAL_REBUILD automations")
+            if has_ambiguous:
+                n_amb = audit["entity_match_stats"]["AMBIGUOUS_ENTITY"]
+                issues.append(f"{n_amb} AMBIGUOUS_ENTITY mappings")
+            print(f"\n[STRICT MODE] Failing due to: {', '.join(issues)}", file=sys.stderr)
+            sys.exit(1)
 
 
 if __name__ == "__main__":

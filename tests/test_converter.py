@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for homekit_to_ha.py — domain inference, trigger conversion, action mapping."""
 
+import json
 import os
 import sys
 import unittest
@@ -11,12 +12,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 from homekit_to_ha import (
     CHAR_MAP,
     SERVICE_DOMAIN_MAP,
+    CLASSIFY_READY,
+    CLASSIFY_PARTIAL,
+    CLASSIFY_MANUAL,
     infer_domain_from_service,
     infer_trigger_from_name,
     convert_trigger,
     convert_characteristic_write,
     classify_automation,
     build_audit_report,
+    find_entity,
+    convert_automations,
 )
 
 
@@ -240,7 +246,7 @@ class TestClassifyAutomation(unittest.TestCase):
     """Test that automations are classified correctly based on TODO count and content."""
 
     def test_ready_no_todos(self):
-        """An automation with real trigger, real actions, and no TODOs is 'ready'."""
+        """An automation with real trigger, real actions, and no TODOs is READY_TO_TEST."""
         auto = {
             "id": "hk_abc123",
             "alias": "[HK] Living Room Lights Off",
@@ -249,10 +255,12 @@ class TestClassifyAutomation(unittest.TestCase):
                 {"service": "light.turn_off", "target": {"entity_id": "light.living_room"}},
             ],
         }
-        self.assertEqual(classify_automation(auto), "ready")
+        cls, reasons = classify_automation(auto)
+        self.assertEqual(cls, CLASSIFY_READY)
+        self.assertEqual(len(reasons), 0)
 
     def test_partial_some_todos(self):
-        """An automation with real actions + some TODOs is 'partial'."""
+        """An automation with real actions + some TODOs is REVIEW_REQUIRED."""
         auto = {
             "id": "hk_def456",
             "alias": "[HK] Bedroom Button Press",
@@ -263,11 +271,12 @@ class TestClassifyAutomation(unittest.TestCase):
                 {"service": "scene.turn_on", "target": {"entity_id": "# TODO: Map scene abc123..."}},
             ],
         }
-        result = classify_automation(auto)
-        self.assertEqual(result, "partial")
+        cls, reasons = classify_automation(auto)
+        self.assertEqual(cls, CLASSIFY_PARTIAL)
+        self.assertIn("TODO_ACTION", reasons)
 
     def test_manual_placeholder_trigger(self):
-        """An automation with a placeholder trigger is 'manual'."""
+        """An automation with a placeholder trigger is MANUAL_REBUILD."""
         auto = {
             "id": "hk_ghi789",
             "alias": "[HK] Mystery Automation",
@@ -277,10 +286,12 @@ class TestClassifyAutomation(unittest.TestCase):
                 {"service": "light.turn_on", "target": {"entity_id": "light.porch"}},
             ],
         }
-        self.assertEqual(classify_automation(auto), "manual")
+        cls, reasons = classify_automation(auto)
+        self.assertEqual(cls, CLASSIFY_MANUAL)
+        self.assertIn("PLACEHOLDER_TRIGGER", reasons)
 
     def test_manual_all_todo_actions(self):
-        """An automation where every action is a TODO is 'manual'."""
+        """An automation where every action is a TODO is MANUAL_REBUILD."""
         auto = {
             "id": "hk_jkl012",
             "alias": "[HK] Shortcut Only",
@@ -289,10 +300,13 @@ class TestClassifyAutomation(unittest.TestCase):
                 {"_comment": "# TODO: Unsupported action type: shortcut"},
             ],
         }
-        self.assertEqual(classify_automation(auto), "manual")
+        cls, reasons = classify_automation(auto)
+        self.assertEqual(cls, CLASSIFY_MANUAL)
+        self.assertIn("ALL_TODO_ACTIONS", reasons)
+        self.assertIn("UNSUPPORTED_SHORTCUT_STEP", reasons)
 
     def test_ready_multiple_real_actions(self):
-        """An automation with multiple real actions and no TODOs is 'ready'."""
+        """An automation with multiple real actions and no TODOs is READY_TO_TEST."""
         auto = {
             "id": "hk_mno345",
             "alias": "[HK] Goodnight Scene",
@@ -303,7 +317,23 @@ class TestClassifyAutomation(unittest.TestCase):
                 {"service": "cover.close_cover", "target": {"entity_id": "cover.blinds"}},
             ],
         }
-        self.assertEqual(classify_automation(auto), "ready")
+        cls, reasons = classify_automation(auto)
+        self.assertEqual(cls, CLASSIFY_READY)
+        self.assertEqual(len(reasons), 0)
+
+    def test_ambiguous_entity_gets_reason_code(self):
+        """An automation with an AMBIGUOUS_ENTITY marker is flagged."""
+        auto = {
+            "id": "hk_amb001",
+            "alias": "[HK] Ambiguous Entity",
+            "triggers": [{"platform": "time", "at": "20:00:00"}],
+            "actions": [
+                {"service": "light.turn_on",
+                 "target": {"entity_id": "# TODO: AMBIGUOUS_ENTITY - multiple matches for 'Kitchen Light'"}},
+            ],
+        }
+        cls, reasons = classify_automation(auto)
+        self.assertIn("AMBIGUOUS_ENTITY", reasons)
 
 
 class TestBuildAuditReport(unittest.TestCase):
@@ -314,13 +344,13 @@ class TestBuildAuditReport(unittest.TestCase):
             {"alias": "Auto A", "actions": [{"service": "light.turn_on", "target": {"entity_id": "light.a"}}]},
             {"alias": "Auto B", "actions": [{"service": "# TODO: Add actions"}]},
         ]
-        classifications = ["ready", "manual"]
+        classifications = [(CLASSIFY_READY, []), (CLASSIFY_MANUAL, ["ALL_TODO_ACTIONS"])]
         report = build_audit_report(automations, classifications)
 
         self.assertIn("summary", report)
-        self.assertEqual(report["summary"]["ready"], 1)
-        self.assertEqual(report["summary"]["manual"], 1)
-        self.assertEqual(report["summary"]["partial"], 0)
+        self.assertEqual(report["summary"][CLASSIFY_READY], 1)
+        self.assertEqual(report["summary"][CLASSIFY_MANUAL], 1)
+        self.assertEqual(report["summary"][CLASSIFY_PARTIAL], 0)
         self.assertEqual(report["summary"]["total"], 2)
 
     def test_todo_counting(self):
@@ -337,20 +367,20 @@ class TestBuildAuditReport(unittest.TestCase):
         }
         report = build_audit_report(
             [auto_with_todos, auto_no_todos],
-            ["partial", "ready"],
+            [(CLASSIFY_PARTIAL, ["TODO_ACTION"]), (CLASSIFY_READY, [])],
         )
         self.assertGreater(report["summary"]["total_todos"], 0)
         # The clean one should have 0 TODOs
-        ready_entry = report["ready"][0]
+        ready_entry = report[CLASSIFY_READY][0]
         self.assertEqual(ready_entry["todos"], 0)
 
     def test_empty_input(self):
         report = build_audit_report([], [])
         self.assertEqual(report["summary"]["total"], 0)
-        self.assertEqual(report["summary"]["ready"], 0)
-        self.assertEqual(len(report["ready"]), 0)
-        self.assertEqual(len(report["partial"]), 0)
-        self.assertEqual(len(report["manual"]), 0)
+        self.assertEqual(report["summary"][CLASSIFY_READY], 0)
+        self.assertEqual(len(report[CLASSIFY_READY]), 0)
+        self.assertEqual(len(report[CLASSIFY_PARTIAL]), 0)
+        self.assertEqual(len(report[CLASSIFY_MANUAL]), 0)
 
     def test_all_partial(self):
         autos = [
@@ -360,10 +390,149 @@ class TestBuildAuditReport(unittest.TestCase):
             ]}
             for i in range(3)
         ]
-        report = build_audit_report(autos, ["partial"] * 3)
-        self.assertEqual(report["summary"]["partial"], 3)
-        self.assertEqual(report["summary"]["ready"], 0)
-        self.assertEqual(report["summary"]["manual"], 0)
+        report = build_audit_report(autos, [(CLASSIFY_PARTIAL, ["TODO_ACTION"])] * 3)
+        self.assertEqual(report["summary"][CLASSIFY_PARTIAL], 3)
+        self.assertEqual(report["summary"][CLASSIFY_READY], 0)
+        self.assertEqual(report["summary"][CLASSIFY_MANUAL], 0)
+
+    def test_reason_codes_preserved(self):
+        """Reason codes from classification should appear in the report entries."""
+        auto = {"alias": "Test", "actions": [{"_comment": "# TODO: fix"}]}
+        report = build_audit_report(
+            [auto],
+            [(CLASSIFY_MANUAL, ["ALL_TODO_ACTIONS", "PLACEHOLDER_TRIGGER"])],
+        )
+        entry = report[CLASSIFY_MANUAL][0]
+        self.assertIn("reasons", entry)
+        self.assertEqual(len(entry["reasons"]), 2)
+        self.assertIn("ALL_TODO_ACTIONS", entry["reasons"])
+
+
+class TestFindEntityAmbiguity(unittest.TestCase):
+    """Test that entity resolution detects and refuses ambiguous matches."""
+
+    def _build_registry(self, names):
+        """Build entity lookup structures from a list of (name, entity_id) tuples."""
+        import re
+        entity_by_name = {}
+        entity_by_normalized = {}
+        all_entities = []
+        for name, eid in names:
+            entity_by_name[name] = eid
+            normalized = re.sub(r"[^a-z0-9 ]", "", name.lower()).strip()
+            entity_by_normalized[normalized] = eid
+            all_entities.append({"entity_id": eid, "name": name, "normalized": normalized})
+        return entity_by_name, entity_by_normalized, all_entities
+
+    def test_exact_match_returns_exact(self):
+        by_name, by_norm, all_ents = self._build_registry([
+            ("Kitchen Light", "light.kitchen"),
+            ("Bedroom Light", "light.bedroom"),
+        ])
+        eid, reason = find_entity("Kitchen Light", "", "", by_name, by_norm, all_ents)
+        self.assertEqual(eid, "light.kitchen")
+        self.assertEqual(reason, "EXACT_NAME")
+
+    def test_fuzzy_ambiguous_returns_none(self):
+        """Two similar entities should trigger AMBIGUOUS_ENTITY."""
+        by_name, by_norm, all_ents = self._build_registry([
+            ("Kitchen Light 1", "light.kitchen_1"),
+            ("Kitchen Light 2", "light.kitchen_2"),
+        ])
+        eid, reason = find_entity("Kitchen Light", "", "", by_name, by_norm, all_ents)
+        # Should be ambiguous (substring match finds both)
+        self.assertEqual(reason, "AMBIGUOUS_ENTITY")
+        self.assertIsNone(eid)
+
+    def test_clear_fuzzy_match_succeeds(self):
+        """A clearly different set should not trigger ambiguity."""
+        by_name, by_norm, all_ents = self._build_registry([
+            ("Kitchen Light", "light.kitchen"),
+            ("Garage Door", "cover.garage_door"),
+        ])
+        eid, reason = find_entity("Kitchen Lite", "", "", by_name, by_norm, all_ents)
+        # Should fuzzy-match to Kitchen Light with high confidence
+        self.assertIsNotNone(eid)
+        self.assertTrue(reason.startswith("FUZZY_"))
+
+    def test_no_match_returns_unmatched(self):
+        by_name, by_norm, all_ents = self._build_registry([
+            ("Kitchen Light", "light.kitchen"),
+        ])
+        eid, reason = find_entity("Patio Heater", "", "", by_name, by_norm, all_ents)
+        self.assertIsNone(eid)
+        self.assertEqual(reason, "UNMATCHED")
+
+    def test_no_name_returns_no_name(self):
+        by_name, by_norm, all_ents = self._build_registry([])
+        eid, reason = find_entity("", "", "", by_name, by_norm, all_ents)
+        self.assertIsNone(eid)
+        self.assertEqual(reason, "NO_NAME")
+
+    def test_room_stripped_match(self):
+        by_name, by_norm, all_ents = self._build_registry([
+            ("Lamp", "light.lamp"),
+        ])
+        eid, reason = find_entity("Bedroom Lamp", "Bedroom", "", by_name, by_norm, all_ents)
+        self.assertEqual(eid, "light.lamp")
+        self.assertEqual(reason, "ROOM_PLUS_SERVICE")
+
+
+class TestEndToEnd(unittest.TestCase):
+    """End-to-end test: merge fixtures -> convert -> verify audit."""
+
+    def test_fixture_to_yaml_pipeline(self):
+        """Run the full merge → convert → audit pipeline on test fixtures."""
+        fixtures_dir = os.path.join(os.path.dirname(__file__), "fixtures")
+
+        # Load fixtures
+        with open(os.path.join(fixtures_dir, "app_export_minimal.json"), "r") as f:
+            app_data = json.load(f)
+        with open(os.path.join(fixtures_dir, "homed_export_minimal.json"), "r") as f:
+            homed_data = json.load(f)
+
+        # Merge
+        from merge_exports import merge_exports
+        merged, merge_stats = merge_exports(app_data, homed_data)
+
+        # Verify merge
+        self.assertEqual(merge_stats["matched"], 4)
+        self.assertEqual(merge_stats["unmatched_homed"], 1)
+
+        # Convert (with no entity registry — all will be TODOs)
+        def stub_lookup(name, room, service):
+            return f"# TODO: Map entity for '{name}'", "NO_MAP"
+
+        automations, audit = convert_automations(merged, stub_lookup)
+
+        # Should have 5 automations (4 matched + 1 homed-only)
+        self.assertEqual(len(automations), 5)
+
+        # Audit summary should be populated
+        s = audit["summary"]
+        self.assertEqual(s["total"], 5)
+        self.assertGreater(s["total_todos"], 0)
+
+        # Without entity mapping, nothing should be READY_TO_TEST
+        self.assertEqual(s[CLASSIFY_READY], 0)
+
+        # All automations should have an id and alias
+        for auto in automations:
+            self.assertIn("id", auto)
+            self.assertIn("alias", auto)
+            self.assertTrue(auto["alias"].startswith("[HK]"))
+
+        # Verify audit has all three classification lists
+        self.assertIn(CLASSIFY_READY, audit)
+        self.assertIn(CLASSIFY_PARTIAL, audit)
+        self.assertIn(CLASSIFY_MANUAL, audit)
+
+        # Every automation should appear in exactly one classification bucket
+        all_names_in_audit = set()
+        for bucket in [CLASSIFY_READY, CLASSIFY_PARTIAL, CLASSIFY_MANUAL]:
+            for entry in audit[bucket]:
+                all_names_in_audit.add(entry["name"])
+        self.assertEqual(len(all_names_in_audit), 5)
 
 
 if __name__ == "__main__":

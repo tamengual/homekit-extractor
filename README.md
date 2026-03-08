@@ -33,11 +33,13 @@ A Python script that reads Apple's internal HomeKit daemon database (`~/Library/
 - Trigger events with full characteristic references
 
 ### Method 3: Home Assistant Conversion (best-effort)
-Python scripts that combine both exports and produce Home Assistant automation YAML **as a starting point**. Every automation gets a readiness classification (READY / PARTIAL / MANUAL) and `# TODO` annotations where manual work is needed:
-- Entity mapping from HomeKit accessory names to HA entity IDs (fuzzy — verify all matches)
+Python scripts that combine both exports and produce Home Assistant automation YAML **as a starting point**. Every automation gets a readiness classification and `# TODO` annotations where manual work is needed:
+- Entity mapping from HomeKit accessory names to HA entity IDs (with ambiguity detection — refuses to guess when multiple candidates are too close)
 - Characteristic-to-service-call translation (brightness, color, temperature, etc.)
 - Conditional logic preservation (toggle patterns, if/else branches)
-- Audit report showing how many automations are import-ready vs. need editing
+- Audit report classifying each automation as `READY_TO_TEST` / `REVIEW_REQUIRED` / `MANUAL_REBUILD` with reason codes
+- Structured JSON audit output (`--audit-json`) for tooling and debugging
+- Strict mode (`--strict`) that exits nonzero on ambiguous entities or unresolvable automations
 
 ## Quick Start
 
@@ -86,10 +88,15 @@ python3 homekit_to_ha.py \
 > automation YAML with `# TODO` comments wherever manual intervention is needed —
 > entity IDs that couldn't be mapped, button triggers that need device-specific
 > configuration, and shortcut actions whose scene references couldn't be resolved.
-> The audit report printed at the end classifies each automation as READY, PARTIAL,
-> or MANUAL. Even "READY" automations should be reviewed before importing — the
-> entity mapping is fuzzy and may produce incorrect matches.  **Do not disable
+> The audit report printed at the end classifies each automation as
+> `READY_TO_TEST`, `REVIEW_REQUIRED`, or `MANUAL_REBUILD` with reason codes
+> explaining *why*.  Even `READY_TO_TEST` automations should be verified — the
+> entity mapping is heuristic and may match the wrong device.  Use `--strict` to
+> fail the conversion if any entity mapping is ambiguous.  **Do not disable
 > HomeKit until you've verified every converted automation works in HA.**
+>
+> Use `--audit-json audit.json` to get a machine-readable report for scripting
+> or building a second-pass fixer.
 
 ## Project Structure
 
