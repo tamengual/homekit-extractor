@@ -290,8 +290,8 @@ def convert_trigger(automation):
             triggers.append(trigger)
 
         elif evt_type == "charValue":
-            char_name = event.get("characteristic", "")
-            accessory = event.get("accessory", "")
+            char_name = event.get("characteristic", "") or ""
+            accessory = event.get("accessory", "") or ""
             value = event.get("eventValue")
 
             if "Programmable Switch" in char_name or "switch" in char_name.lower():
@@ -758,6 +758,49 @@ def build_audit_report(automations, classifications):
 
 # ============ MAIN CONVERSION ============
 
+def _normalize_automation(auto):
+    """Normalize an automation from either export format to canonical keys.
+
+    The Catalyst app export uses different key names than the homed export:
+      App export                  Canonical (homed/converter)
+      ─────────────────────────   ──────────────────────────
+      action.type                 action.actionType
+      action.roomName             action.room
+      auto.trigger.events         auto.events
+      type="nonCharacteristic"    actionType="shortcut"
+
+    This function normalizes in-place so the converter can handle both.
+    """
+    # Promote trigger.events to top-level events
+    if "events" not in auto and "trigger" in auto:
+        trigger_obj = auto.get("trigger", {})
+        if isinstance(trigger_obj, dict) and "events" in trigger_obj:
+            auto["events"] = trigger_obj["events"]
+
+    # Ensure events key exists
+    if "events" not in auto:
+        auto["events"] = []
+
+    # Normalize action keys
+    for aset in auto.get("actionSets", []):
+        for action in aset.get("actions", []):
+            # type → actionType
+            if "actionType" not in action and "type" in action:
+                raw_type = action["type"]
+                if raw_type == "characteristicWrite":
+                    action["actionType"] = "characteristicWrite"
+                elif raw_type == "nonCharacteristic":
+                    action["actionType"] = "shortcut"
+                else:
+                    action["actionType"] = raw_type
+
+            # roomName → room
+            if "room" not in action and "roomName" in action:
+                action["room"] = action["roomName"]
+
+    return auto
+
+
 def convert_automations(export_data, entity_lookup):
     """Convert all HomeKit automations to HA YAML format.
 
@@ -777,6 +820,7 @@ def convert_automations(export_data, entity_lookup):
         return entity_id, reason
 
     for auto in export_data.get("automations", []):
+        auto = _normalize_automation(auto)
         name = auto.get("name", "Unknown")
         enabled = auto.get("enabled", True)
 

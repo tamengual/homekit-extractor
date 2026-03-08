@@ -28,6 +28,7 @@ from homekit_to_ha import (
     _summarize_ha_trigger,
     _summarize_ha_actions,
     simulate_output,
+    _normalize_automation,
 )
 
 
@@ -538,6 +539,69 @@ class TestEndToEnd(unittest.TestCase):
             for entry in audit[bucket]:
                 all_names_in_audit.add(entry["name"])
         self.assertEqual(len(all_names_in_audit), 5)
+
+
+class TestNormalizeAutomation(unittest.TestCase):
+    """Test that app export key names get normalized to canonical format."""
+
+    def test_type_to_actionType(self):
+        """App export 'type' on actions should become 'actionType'."""
+        auto = {
+            "name": "Test",
+            "actionSets": [{"actions": [
+                {"type": "characteristicWrite", "accessoryName": "Light", "roomName": "Living Room"},
+            ]}],
+        }
+        result = _normalize_automation(auto)
+        action = result["actionSets"][0]["actions"][0]
+        self.assertEqual(action["actionType"], "characteristicWrite")
+        self.assertEqual(action["room"], "Living Room")
+
+    def test_nonCharacteristic_becomes_shortcut(self):
+        """App export 'nonCharacteristic' type should become 'shortcut' actionType."""
+        auto = {
+            "name": "Test",
+            "actionSets": [{"actions": [
+                {"type": "nonCharacteristic", "description": "Shortcut action"},
+            ]}],
+        }
+        result = _normalize_automation(auto)
+        self.assertEqual(result["actionSets"][0]["actions"][0]["actionType"], "shortcut")
+
+    def test_trigger_events_promoted(self):
+        """App export nested trigger.events should be promoted to top-level events."""
+        auto = {
+            "name": "Test",
+            "trigger": {
+                "events": [{"eventType": "charValue", "characteristic": "Motion"}],
+                "executeOnce": False,
+            },
+            "actionSets": [{"actions": []}],
+        }
+        result = _normalize_automation(auto)
+        self.assertEqual(len(result["events"]), 1)
+        self.assertEqual(result["events"][0]["eventType"], "charValue")
+
+    def test_homed_format_unchanged(self):
+        """Automations already in homed format should pass through unchanged."""
+        auto = {
+            "name": "Test",
+            "triggerType": "event",
+            "events": [{"eventType": "charValue"}],
+            "actionSets": [{"actions": [
+                {"actionType": "characteristicWrite", "room": "Office"},
+            ]}],
+        }
+        result = _normalize_automation(auto)
+        action = result["actionSets"][0]["actions"][0]
+        self.assertEqual(action["actionType"], "characteristicWrite")
+        self.assertEqual(action["room"], "Office")
+
+    def test_missing_events_gets_empty_list(self):
+        """Automations without events key should get empty list."""
+        auto = {"name": "Test", "actionSets": [{"actions": []}]}
+        result = _normalize_automation(auto)
+        self.assertEqual(result["events"], [])
 
 
 class TestSimulateHelpers(unittest.TestCase):
