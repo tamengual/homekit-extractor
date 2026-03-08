@@ -1,0 +1,28 @@
+name: HomeKitDumper
+options:
+  bundleIdPrefix: com.yourname
+  deploymentTarget:
+    iOS: "16.0"
+  xcodeVersion: "15.0"
+
+settings:
+  base:
+    SUPPORTS_MACCATALYST: "YES"
+    DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: "NO"
+    SWIFT_VERSION: "5.9"
+    DEVELOPMENT_TEAM: YOUR_TEAM_ID  # Replace with your Apple Developer Team ID
+    SWIFT_OBJC_BRIDGING_HEADER: "HomeKitDumper/HomeKitDumper-Bridging-Header.h"
+
+targets:
+  HomeKitDumper:
+    type: application
+    platform: iOS
+    sources:
+      - HomeKitDumper
+    settings:
+      base:
+        INFOPLIST_FILE: HomeKitDumper/Info.plist
+        CODE_SIGN_ENTITLEMENTS: HomeKitDumper/HomeKitDumper.entitlements
+        PRODUCT_BUNDLE_IDENTIFIER: com.yourname.HomeKitDumper
+    entitlements:
+      path: HomeKitDumper/HomeKitDumper.entitlements

@@ -1,0 +1,289 @@
+{
+  "extractionSource": "homed_core.sqlite",
+  "extractionDate": "2026-03-08T13:43:25.721828",
+  "homeName": "Example Home",
+  "stats": {
+    "totalAutomations": 5,
+    "shortcutAutomations": 2,
+    "characteristicWriteActions": 8,
+    "totalWorkflowSteps": 10
+  },
+  "automations": [
+    {
+      "_comment": "Example 1: Direct characteristic write automation (time trigger)",
+      "name": "Turn Off Lights at 11 PM",
+      "enabled": true,
+      "triggerType": "timer",
+      "events": [],
+      "actionSets": [
+        {
+          "name": "Bedtime",
+          "type": "com.apple.HomeKit.actionSet.type.trigger",
+          "actions": [
+            {
+              "actionType": "characteristicWrite",
+              "targetValue": false,
+              "characteristic": "Power State",
+              "characteristicType": "00000025-0000-1000-8000-0026BB765291",
+              "format": "bool",
+              "accessoryName": "Living Room Light",
+              "serviceName": "Lightbulb",
+              "room": "Living Room"
+            },
+            {
+              "actionType": "characteristicWrite",
+              "targetValue": false,
+              "characteristic": "Power State",
+              "characteristicType": "00000025-0000-1000-8000-0026BB765291",
+              "format": "bool",
+              "accessoryName": "Kitchen Light",
+              "serviceName": "Lightbulb",
+              "room": "Kitchen"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "_comment": "Example 2: Shortcut toggle automation (button press trigger)",
+      "name": "Bedroom Button Single Press",
+      "enabled": true,
+      "triggerType": "event",
+      "events": [
+        {
+          "eventType": "charValue",
+          "characteristic": "Programmable Switch Event",
+          "accessory": "Bedroom Button",
+          "service": "Stateless Programmable Switch",
+          "eventValue": 0,
+          "format": "uint8"
+        }
+      ],
+      "actionSets": [
+        {
+          "name": "",
+          "type": "com.apple.HomeKit.actionSet.type.trigger",
+          "actions": [
+            {
+              "actionType": "shortcut",
+              "workflowSteps": [
+                {
+                  "type": "conditional",
+                  "mode": "if",
+                  "condition": "is",
+                  "inputType": "HomeAccessory"
+                },
+                {
+                  "type": "homeaccessory",
+                  "actionSets": [
+                    {
+                      "actionSetUUID": "XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX",
+                      "writeActions": [
+                        {
+                          "enabled": true,
+                          "targetValue": false
+                        }
+                      ],
+                      "sceneModelID": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+                      "homeModelID": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                    }
+                  ]
+                },
+                {
+                  "type": "conditional",
+                  "mode": "else"
+                },
+                {
+                  "type": "homeaccessory",
+                  "actionSets": [
+                    {
+                      "actionSetUUID": "YYYYYYYY-YYYY-YYYY-YYYY-YYYYYYYYYYYY",
+                      "writeActions": [
+                        {
+                          "enabled": true,
+                          "targetValue": true
+                        },
+                        {
+                          "enabled": true,
+                          "targetValue": 100
+                        }
+                      ],
+                      "sceneModelID": "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy",
+                      "homeModelID": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                    }
+                  ]
+                },
+                {
+                  "type": "conditional",
+                  "mode": "end"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "_comment": "Example 3: Sunrise trigger with offset",
+      "name": "Open Blinds at Sunrise",
+      "enabled": true,
+      "triggerType": "event",
+      "significantEvent": "sunrise",
+      "significantEventOffsetSeconds": 1800,
+      "events": [
+        {
+          "eventType": "significantTime",
+          "significantEvent": "sunrise",
+          "offsetSeconds": 1800
+        }
+      ],
+      "actionSets": [
+        {
+          "name": "",
+          "type": "com.apple.HomeKit.actionSet.type.trigger",
+          "actions": [
+            {
+              "actionType": "characteristicWrite",
+              "targetValue": 100,
+              "characteristic": "Target Position",
+              "characteristicType": "0000007C-0000-1000-8000-0026BB765291",
+              "format": "uint8",
+              "accessoryName": "Bedroom Blinds",
+              "serviceName": "Window Covering",
+              "room": "Bedroom"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "_comment": "Example 4: Shortcut with nested conditionals and menu",
+      "name": "Smart Bedtime Routine",
+      "enabled": true,
+      "triggerType": "event",
+      "events": [],
+      "actionSets": [
+        {
+          "name": "",
+          "type": "com.apple.HomeKit.actionSet.type.trigger",
+          "actions": [
+            {
+              "actionType": "shortcut",
+              "workflowSteps": [
+                {
+                  "type": "conditional",
+                  "mode": "if",
+                  "condition": "is",
+                  "inputType": "HomeAccessory"
+                },
+                {
+                  "type": "homeaccessory",
+                  "actionSets": [
+                    {
+                      "sceneModelID": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                      "homeModelID": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                    }
+                  ]
+                },
+                {
+                  "type": "conditional",
+                  "mode": "else"
+                },
+                {
+                  "type": "conditional",
+                  "mode": "if",
+                  "condition": "c",
+                  "inputType": ""
+                },
+                {
+                  "type": "homeaccessory",
+                  "actionSets": [
+                    {
+                      "sceneModelID": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                      "homeModelID": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                    }
+                  ]
+                },
+                {
+                  "type": "conditional",
+                  "mode": "else"
+                },
+                {
+                  "type": "homeaccessory",
+                  "actionSets": [
+                    {
+                      "sceneModelID": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+                      "homeModelID": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                    }
+                  ]
+                },
+                {
+                  "type": "conditional",
+                  "mode": "end"
+                },
+                {
+                  "type": "conditional",
+                  "mode": "end"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "_comment": "Example 5: Motion sensor trigger with direct actions",
+      "name": "Front Door Motion Detected",
+      "enabled": true,
+      "triggerType": "event",
+      "events": [
+        {
+          "eventType": "charValue",
+          "characteristic": "Motion Detected",
+          "accessory": "Front Door Camera",
+          "service": "Motion Sensor",
+          "eventValue": true,
+          "format": "bool"
+        }
+      ],
+      "actionSets": [
+        {
+          "name": "Welcome",
+          "type": "com.apple.HomeKit.actionSet.type.trigger",
+          "actions": [
+            {
+              "actionType": "characteristicWrite",
+              "targetValue": true,
+              "characteristic": "Power State",
+              "characteristicType": "00000025-0000-1000-8000-0026BB765291",
+              "format": "bool",
+              "accessoryName": "Porch Light",
+              "serviceName": "Lightbulb",
+              "room": "Entryway"
+            },
+            {
+              "actionType": "characteristicWrite",
+              "targetValue": 80,
+              "characteristic": "Brightness",
+              "characteristicType": "00000008-0000-1000-8000-0026BB765291",
+              "format": "int",
+              "accessoryName": "Porch Light",
+              "serviceName": "Lightbulb",
+              "room": "Entryway"
+            },
+            {
+              "actionType": "characteristicWrite",
+              "targetValue": 250,
+              "characteristic": "Color Temperature",
+              "characteristicType": "000000CE-0000-1000-8000-0026BB765291",
+              "format": "int",
+              "accessoryName": "Porch Light",
+              "serviceName": "Lightbulb",
+              "room": "Entryway"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
