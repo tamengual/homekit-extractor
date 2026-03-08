@@ -12,7 +12,6 @@ If you have a complex HomeKit setup and want to migrate to Home Assistant, you'l
 2. **No export feature exists.** Apple provides no way to export automations from the Home app.
 3. **Third-party apps hit the same wall.** Controller for HomeKit, Eve, etc. all use the same `HMHomeManager` API and get the same opaque objects.
 
-For a setup with ~200 automations where ~66 use "Convert to Shortcut" for conditional logic, this means a third of your automations are invisible to any export tool.
 
 ## The Solution
 
