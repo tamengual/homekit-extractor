@@ -1,0 +1,113 @@
+{
+  "homeName": "Test Home",
+  "automations": [
+    {
+      "name": "Turn Off Lights at 11 PM",
+      "enabled": true,
+      "triggerType": "timer",
+      "events": [],
+      "actionSets": [
+        {
+          "name": "Bedtime",
+          "type": "com.apple.HomeKit.actionSet.type.trigger",
+          "actions": [
+            {
+              "actionType": "characteristicWrite",
+              "targetValue": false,
+              "characteristic": "Power State",
+              "characteristicType": "00000025-0000-1000-8000-0026BB765291",
+              "format": "bool",
+              "accessoryName": "Living Room Light",
+              "serviceName": "Lightbulb",
+              "room": "Living Room"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Bedroom Button Single Press",
+      "enabled": true,
+      "isLikelyShortcut": true,
+      "actionSets": [
+        {
+          "name": "",
+          "type": "com.apple.HomeKit.actionSet.type.trigger",
+          "actions": [
+            {
+              "actionType": "shortcut"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Front Door Motion Detected",
+      "enabled": true,
+      "triggerType": "event",
+      "events": [
+        {
+          "eventType": "charValue",
+          "characteristic": "Motion Detected",
+          "accessory": "Front Door Camera",
+          "eventValue": true
+        }
+      ],
+      "actionSets": [
+        {
+          "name": "Welcome",
+          "type": "com.apple.HomeKit.actionSet.type.trigger",
+          "actions": [
+            {
+              "actionType": "characteristicWrite",
+              "targetValue": true,
+              "characteristic": "Power State",
+              "characteristicType": "00000025-0000-1000-8000-0026BB765291",
+              "format": "bool",
+              "accessoryName": "Porch Light",
+              "serviceName": "Lightbulb",
+              "room": "Entryway"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Garage Fan On",
+      "enabled": true,
+      "triggerType": "timer",
+      "events": [],
+      "actionSets": [
+        {
+          "name": "",
+          "type": "com.apple.HomeKit.actionSet.type.trigger",
+          "actions": [
+            {
+              "actionType": "characteristicWrite",
+              "targetValue": true,
+              "characteristic": "Power State",
+              "characteristicType": "00000025-0000-1000-8000-0026BB765291",
+              "format": "bool",
+              "accessoryName": "Garage Fan",
+              "serviceName": "Fan",
+              "room": "Garage"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "scenes": [
+    {
+      "name": "Bedroom Off",
+      "uniqueIdentifier": "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA",
+      "actions": [
+        {
+          "accessoryName": "Bedroom Light",
+          "characteristic": "Power State",
+          "targetValue": false
+        }
+      ]
+    }
+  ]
+}

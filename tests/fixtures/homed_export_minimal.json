@@ -1,0 +1,153 @@
+{
+  "extractionSource": "homed_core.sqlite",
+  "extractionDate": "2026-03-08T12:00:00",
+  "homeName": "Test Home",
+  "automations": [
+    {
+      "name": "Turn Off Lights at 11 PM",
+      "enabled": true,
+      "triggerType": "timer",
+      "events": [],
+      "actionSets": [
+        {
+          "name": "Bedtime",
+          "type": "com.apple.HomeKit.actionSet.type.trigger",
+          "actions": [
+            {
+              "actionType": "characteristicWrite",
+              "accessoryName": "Living Room Light",
+              "serviceName": "Lightbulb",
+              "room": "Living Room"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Bedroom Button Single Press",
+      "enabled": true,
+      "triggerType": "event",
+      "events": [
+        {
+          "eventType": "charValue",
+          "characteristic": "Programmable Switch Event",
+          "accessory": "Bedroom Button",
+          "service": "Stateless Programmable Switch",
+          "eventValue": 0,
+          "format": "uint8"
+        }
+      ],
+      "actionSets": [
+        {
+          "name": "",
+          "type": "com.apple.HomeKit.actionSet.type.trigger",
+          "actions": [
+            {
+              "actionType": "shortcut",
+              "workflowSteps": [
+                {
+                  "type": "conditional",
+                  "mode": "if",
+                  "condition": "is",
+                  "inputType": "HomeAccessory"
+                },
+                {
+                  "type": "homeaccessory",
+                  "actionSets": [
+                    {
+                      "writeActions": [{"enabled": true, "targetValue": false}],
+                      "sceneModelID": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+                    }
+                  ]
+                },
+                {
+                  "type": "conditional",
+                  "mode": "else"
+                },
+                {
+                  "type": "homeaccessory",
+                  "actionSets": [
+                    {
+                      "writeActions": [{"enabled": true, "targetValue": true}],
+                      "sceneModelID": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+                    }
+                  ]
+                },
+                {
+                  "type": "conditional",
+                  "mode": "end"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Front Door Motion Detected",
+      "enabled": true,
+      "triggerType": "event",
+      "events": [
+        {
+          "eventType": "charValue",
+          "characteristic": "Motion Detected",
+          "accessory": "Front Door Camera",
+          "eventValue": true
+        }
+      ],
+      "actionSets": [
+        {
+          "name": "Welcome",
+          "type": "com.apple.HomeKit.actionSet.type.trigger",
+          "actions": [
+            {
+              "actionType": "characteristicWrite",
+              "accessoryName": "Porch Light",
+              "serviceName": "Lightbulb",
+              "room": "Entryway"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Garage Fan On",
+      "enabled": true,
+      "triggerType": "timer",
+      "events": [],
+      "actionSets": [
+        {
+          "name": "",
+          "type": "com.apple.HomeKit.actionSet.type.trigger",
+          "actions": [
+            {
+              "actionType": "characteristicWrite",
+              "accessoryName": "Garage Fan",
+              "serviceName": "Fan",
+              "room": "Garage"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Homed-Only Automation",
+      "enabled": false,
+      "triggerType": "timer",
+      "events": [],
+      "actionSets": [
+        {
+          "name": "",
+          "type": "com.apple.HomeKit.actionSet.type.trigger",
+          "actions": [
+            {
+              "actionType": "characteristicWrite",
+              "accessoryName": "Test Device",
+              "serviceName": "Switch"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -36,8 +36,13 @@ from difflib import SequenceMatcher
 
 # Standard HomeKit characteristic type suffixes (last 8 hex digits of UUID)
 # Full UUID format: 0000XXXX-0000-1000-8000-0026BB765291
+#
+# For characteristics that appear across multiple domains (e.g., Power State
+# applies to lights, switches, fans, and outlets), the domain is resolved
+# dynamically via infer_domain_from_service() using the HomeKit service name.
+# The "domain" value here is only used as a fallback.
 CHAR_MAP = {
-    "00000025": {"name": "Power State", "domain": "light", "param": None},
+    "00000025": {"name": "Power State", "domain": "light", "param": None, "multi_domain": True},
     "00000008": {"name": "Brightness", "domain": "light", "param": "brightness_pct"},
     "00000013": {"name": "Hue", "domain": "light", "param": "hs_color_h"},
     "0000002f": {"name": "Saturation", "domain": "light", "param": "hs_color_s"},
@@ -50,6 +55,64 @@ CHAR_MAP = {
     "00000073": {"name": "Programmable Switch Event", "domain": "button", "param": None},
     "000000f1": {"name": "Target Heating Cooling State", "domain": "climate", "param": None},
 }
+
+# HomeKit service name → HA domain mapping.  Used to resolve multi-domain
+# characteristics like Power State whose HA domain depends on the device type.
+SERVICE_DOMAIN_MAP = {
+    # Lights
+    "lightbulb": "light",
+    "light": "light",
+    # Switches / outlets
+    "switch": "switch",
+    "outlet": "switch",
+    "smart plug": "switch",
+    "stateless programmable switch": "button",
+    # Fans
+    "fan": "fan",
+    "fanv2": "fan",
+    # Covers
+    "window covering": "cover",
+    "window": "cover",
+    "door": "cover",
+    "garage door opener": "cover",
+    # Climate
+    "thermostat": "climate",
+    "heater cooler": "climate",
+    # Locks
+    "lock mechanism": "lock",
+    "lock": "lock",
+    # Media
+    "television": "media_player",
+    "smart speaker": "media_player",
+    # Sensors (no turn_on/turn_off)
+    "motion sensor": "binary_sensor",
+    "occupancy sensor": "binary_sensor",
+    "contact sensor": "binary_sensor",
+    "leak sensor": "binary_sensor",
+    "smoke sensor": "binary_sensor",
+    "carbon monoxide sensor": "binary_sensor",
+    "temperature sensor": "sensor",
+    "humidity sensor": "sensor",
+    "light sensor": "sensor",
+    "air quality sensor": "sensor",
+    # Valves
+    "valve": "valve",
+    "irrigation": "valve",
+    "faucet": "valve",
+}
+
+
+def infer_domain_from_service(service_name, fallback_domain="light"):
+    """Resolve HA domain from a HomeKit service name.
+
+    For multi-domain characteristics (e.g., Power State can be light, switch,
+    fan, or outlet), this function uses the service name to pick the correct
+    HA domain.  Falls back to `fallback_domain` if the service is unknown.
+    """
+    if not service_name:
+        return fallback_domain
+    key = service_name.lower().strip()
+    return SERVICE_DOMAIN_MAP.get(key, fallback_domain)
 
 # Programmable Switch Event values
 SWITCH_EVENT_MAP = {0: "single_press", 1: "double_press", 2: "long_press"}
@@ -341,11 +404,18 @@ def convert_characteristic_write(action, entity_lookup):
     # Find HA entity
     entity_id, match_type = entity_lookup(accessory, room, service)
 
-    # Determine service call based on characteristic
-    char_suffix = char_type[-8:].lower() if char_type and len(char_type) >= 8 else ""
+    # Determine service call based on characteristic.
+    # HomeKit UUID format: XXXXXXXX-0000-1000-8000-0026BB765291
+    # The type ID is the first 8 hex digits (e.g., "00000025" for Power State).
+    char_suffix = char_type[:8].lower() if char_type and len(char_type) >= 8 else ""
     char_info = CHAR_MAP.get(char_suffix, {})
 
-    domain = char_info.get("domain", "light")
+    fallback_domain = char_info.get("domain", "light")
+    # For multi-domain characteristics, resolve via service name
+    if char_info.get("multi_domain"):
+        domain = infer_domain_from_service(service, fallback_domain)
+    else:
+        domain = fallback_domain
     param = char_info.get("param")
 
     # Build service call

@@ -1,8 +1,8 @@
 # HomeKit Extractor
 
-**Export your entire Apple HomeKit setup — including "Convert to Shortcut" automations — to JSON, then convert everything to Home Assistant.**
+**Export your entire Apple HomeKit setup — including "Convert to Shortcut" automations — to JSON, with tools to generate a starting point for Home Assistant migration.**
 
-Apple's HomeKit API (`HMHomeManager`) intentionally hides the internals of automations that use the "Convert to Shortcut" feature. This project extracts *everything* — including the conditional logic (if/then/else), scene references, and device actions inside those opaque shortcuts — by combining two extraction methods and provides tools to convert it all to Home Assistant YAML.
+Apple's HomeKit API (`HMHomeManager`) intentionally hides the internals of automations that use the "Convert to Shortcut" feature. This project extracts *everything* — including the conditional logic (if/then/else), scene references, and device actions inside those opaque shortcuts — by combining two extraction methods. It also provides conversion scripts that produce Home Assistant automation YAML as a **starting point that will require manual review and editing** for your specific setup.
 
 ## The Problem
 
@@ -81,6 +81,12 @@ python3 homekit_to_ha.py \
   --entity-registry core.entity_registry \
   -o homekit_automations.yaml
 ```
+
+> **Note:** The converter produces automation YAML with `# TODO` comments wherever
+> manual intervention is needed — entity IDs that couldn't be mapped, button
+> triggers that need device-specific configuration, and shortcut actions whose
+> scene references couldn't be resolved.  Expect to review and edit every
+> automation before importing into Home Assistant.
 
 ## Project Structure
 
@@ -214,11 +220,22 @@ The merged JSON output contains every automation with full detail:
 
 ## Limitations
 
+### Extraction
 - **Read-only** — This project only reads data. It cannot modify, create, or delete automations.
 - **macOS only** — The homed database is only accessible on macOS (not iOS). The Catalyst app runs on both.
 - **Full Disk Access required** — The homed database is TCC-protected. You must grant Full Disk Access to Terminal.
 - **Protobuf UUIDs unresolvable** — Device references inside shortcut workflows use an isolated UUID namespace. The scripts fall back to name-based matching.
 - **No iCloud sync data** — This reads the local database copy. If your Home Hub hasn't synced recently, data may be stale.
+
+### Merge
+- **Name-based matching with heuristics** — The merge script uses multi-signal matching (name similarity, trigger type, action count, enabled state) but fundamentally relies on automation names being unique and consistent across both exports. Duplicate names will produce lower-confidence matches flagged with warnings.
+- **Protobuf UUIDs don't cross-reference** — UUIDs inside the homed database don't match UUIDs from the API export, so the merge cannot verify identity by UUID.
+
+### Home Assistant Conversion
+- **Requires manual review** — The converter generates `# TODO` comments for anything it can't resolve automatically (unmapped entities, device-specific triggers, unresolved scene references). This is a starting point, not a finished product.
+- **Entity mapping is fuzzy** — Name-based matching between HomeKit accessory names and HA entity IDs can produce false matches. Always verify the mapped entity IDs.
+- **Button triggers are generic** — HomeKit button presses are converted to placeholder event triggers. You'll need to replace these with device triggers specific to your integration (ZHA, MQTT, Matter, etc.).
+- **No scene import** — HomeKit scenes are referenced but not converted to HA scenes. You may need to create matching HA scenes manually.
 
 ## Privacy & Security
 
