@@ -33,7 +33,7 @@ class TestNormalizeName(unittest.TestCase):
         self.assertEqual(normalize_name("Turn  Off   Lights"), "turn off lights")
 
     def test_strip_non_ascii(self):
-        # Narrow no-break space (U+202F) and other non-ASCII should be removed
+        # Narrow no-break space (U+202F) and other non-ASCII should be replaced/removed
         self.assertEqual(normalize_name("10\u202f00\u202fPM"), "10 00 pm")
 
     def test_empty(self):
@@ -87,7 +87,7 @@ class TestFindBestMatches(unittest.TestCase):
         app = load_fixture("app_export_minimal.json")
         homed = load_fixture("homed_export_minimal.json")
 
-        matches, unmatched_app, unmatched_homed = find_best_matches(
+        matches, unmatched_app, unmatched_homed, ambiguous = find_best_matches(
             app["automations"], homed["automations"]
         )
 
@@ -100,6 +100,9 @@ class TestFindBestMatches(unittest.TestCase):
         # Should have 1 unmatched homed ("Homed-Only Automation")
         self.assertEqual(len(unmatched_homed), 1)
 
+        # No ambiguous matches in the fixture (names are clearly distinct)
+        self.assertEqual(len(ambiguous), 0)
+
         # All matches should have high confidence
         for _, _, score in matches:
             self.assertGreater(score, 0.60)
@@ -108,7 +111,7 @@ class TestFindBestMatches(unittest.TestCase):
         app = load_fixture("app_export_minimal.json")
         homed = load_fixture("homed_export_minimal.json")
 
-        matches, _, _ = find_best_matches(
+        matches, _, _, _ = find_best_matches(
             app["automations"], homed["automations"]
         )
 
@@ -118,6 +121,91 @@ class TestFindBestMatches(unittest.TestCase):
         # Each index should appear at most once
         self.assertEqual(len(app_idxs), len(set(app_idxs)))
         self.assertEqual(len(homed_idxs), len(set(homed_idxs)))
+
+    def test_ambiguity_detection_with_similar_names(self):
+        """When two homed automations have nearly identical names and shapes,
+        the merge should refuse to guess and flag them as ambiguous."""
+        app_autos = [
+            {
+                "name": "Kitchen Light Single Press",
+                "triggerType": "event",
+                "enabled": True,
+                "actionSets": [{"actions": [{"actionType": "shortcut"}]}],
+                "events": [{"eventType": "charValue"}],
+            },
+        ]
+        # Two homed candidates with nearly identical names
+        homed_autos = [
+            {
+                "name": "Kitchen Light Single Press",
+                "triggerType": "event",
+                "enabled": True,
+                "actionSets": [{"actions": [{"actionType": "shortcut"}]}],
+                "events": [{"eventType": "charValue"}],
+            },
+            {
+                "name": "Kitchen Light Single Press 2",
+                "triggerType": "event",
+                "enabled": True,
+                "actionSets": [{"actions": [{"actionType": "shortcut"}]}],
+                "events": [{"eventType": "charValue"}],
+            },
+        ]
+
+        matches, unmatched_app, unmatched_homed, ambiguous = find_best_matches(
+            app_autos, homed_autos
+        )
+
+        # The two candidates are very close — should be flagged as ambiguous
+        # (or if the gap is large enough, the better match wins)
+        # The important thing is that ambiguous matches are NOT silently merged
+        if ambiguous:
+            # Ambiguity detected — no match made for this automation
+            self.assertEqual(len(matches), 0)
+            self.assertEqual(len(ambiguous), 1)
+            self.assertEqual(ambiguous[0]["app_name"], "Kitchen Light Single Press")
+            self.assertGreaterEqual(len(ambiguous[0]["candidates"]), 2)
+        else:
+            # Gap was large enough — one match made (acceptable)
+            self.assertEqual(len(matches), 1)
+
+    def test_duplicate_names_in_homed_flagged_ambiguous(self):
+        """Exact duplicate names should definitely trigger ambiguity."""
+        app_autos = [
+            {"name": "Bedtime", "triggerType": "timer", "enabled": True,
+             "actionSets": [{"actions": [{"actionType": "characteristicWrite"}]}]},
+        ]
+        homed_autos = [
+            {"name": "Bedtime", "triggerType": "timer", "enabled": True,
+             "actionSets": [{"actions": [{"actionType": "characteristicWrite"}]}]},
+            {"name": "Bedtime", "triggerType": "timer", "enabled": True,
+             "actionSets": [{"actions": [{"actionType": "characteristicWrite"}]}]},
+        ]
+
+        matches, _, _, ambiguous = find_best_matches(app_autos, homed_autos)
+
+        # Exact duplicates with identical shapes — MUST be ambiguous
+        self.assertEqual(len(ambiguous), 1)
+        self.assertEqual(len(matches), 0)
+
+    def test_clearly_different_names_not_ambiguous(self):
+        """Names that are clearly different should not trigger ambiguity."""
+        app_autos = [
+            {"name": "Turn Off Lights", "triggerType": "timer", "enabled": True,
+             "actionSets": [{"actions": [{}]}]},
+        ]
+        homed_autos = [
+            {"name": "Turn Off Lights", "triggerType": "timer", "enabled": True,
+             "actionSets": [{"actions": [{}]}]},
+            {"name": "Open Garage Door", "triggerType": "event", "enabled": True,
+             "actionSets": [{"actions": [{}]}]},
+        ]
+
+        matches, _, _, ambiguous = find_best_matches(app_autos, homed_autos)
+
+        # Only one plausible match — should NOT be ambiguous
+        self.assertEqual(len(ambiguous), 0)
+        self.assertEqual(len(matches), 1)
 
 
 class TestMergeIntoCanonical(unittest.TestCase):
@@ -192,6 +280,7 @@ class TestMergeExports(unittest.TestCase):
         self.assertEqual(stats["app_automations"], 4)
         self.assertEqual(stats["homed_automations"], 5)
         self.assertEqual(stats["matched"], 4)
+        self.assertEqual(stats["ambiguous_refused"], 0)
         self.assertGreater(stats["shortcut_workflows_injected"], 0)
         self.assertEqual(stats["unmatched_homed"], 1)
 

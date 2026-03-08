@@ -612,11 +612,80 @@ def build_choose_block(steps, start_idx, entity_lookup):
     return choose, end_idx
 
 
+# ============ AUDIT CLASSIFICATION ============
+
+def classify_automation(ha_auto):
+    """Classify a converted automation's readiness level.
+
+    Returns one of:
+        "ready"   — No TODOs, has real trigger and actions. Can be imported.
+        "partial" — Has some real actions but also TODOs that need fixing.
+        "manual"  — Trigger is placeholder or all actions are TODOs. Needs
+                     significant manual work before it will function.
+    """
+    yaml_str = str(ha_auto)
+    todo_count = yaml_str.count("TODO")
+    has_placeholder_trigger = "manual_trigger_needed" in yaml_str
+    has_real_actions = any(
+        isinstance(a, dict) and "service" in a and "TODO" not in str(a.get("service", ""))
+        for a in ha_auto.get("actions", [])
+    )
+    has_real_trigger = not has_placeholder_trigger and ha_auto.get("triggers")
+
+    if todo_count == 0 and has_real_trigger and has_real_actions:
+        return "ready"
+    elif has_real_actions and has_real_trigger:
+        return "partial"
+    else:
+        return "manual"
+
+
+def build_audit_report(automations, classifications):
+    """Build a structured audit report of conversion quality.
+
+    Returns a dict with:
+    - summary counts per classification
+    - lists of automation names per classification
+    - total TODO count
+    """
+    report = {
+        "ready": [],
+        "partial": [],
+        "manual": [],
+    }
+
+    total_todos = 0
+    for auto, cls in zip(automations, classifications):
+        name = auto.get("alias", auto.get("id", "unknown"))
+        todo_count = str(auto).count("TODO")
+        total_todos += todo_count
+        report[cls].append({"name": name, "todos": todo_count})
+
+    return {
+        "summary": {
+            "ready": len(report["ready"]),
+            "partial": len(report["partial"]),
+            "manual": len(report["manual"]),
+            "total": len(automations),
+            "total_todos": total_todos,
+        },
+        "ready": report["ready"],
+        "partial": report["partial"],
+        "manual": report["manual"],
+    }
+
+
 # ============ MAIN CONVERSION ============
 
 def convert_automations(export_data, entity_lookup):
-    """Convert all HomeKit automations to HA YAML format."""
+    """Convert all HomeKit automations to HA YAML format.
+
+    Returns:
+        automations: list of HA automation dicts
+        audit: structured audit report classifying each automation
+    """
     automations = []
+    classifications = []
 
     for auto in export_data.get("automations", []):
         name = auto.get("name", "Unknown")
@@ -646,8 +715,10 @@ def convert_automations(export_data, entity_lookup):
         }
 
         automations.append(ha_auto)
+        classifications.append(classify_automation(ha_auto))
 
-    return automations
+    audit = build_audit_report(automations, classifications)
+    return automations, audit
 
 
 def to_yaml(automations):
@@ -794,7 +865,7 @@ def main():
             return entity_id, "no_map"
 
     # Convert
-    automations = convert_automations(export_data, entity_lookup)
+    automations, audit = convert_automations(export_data, entity_lookup)
 
     # Output
     yaml_output = to_yaml(automations)
@@ -806,11 +877,36 @@ def main():
     else:
         print(yaml_output)
 
-    # Stats
+    # Audit report
+    s = audit["summary"]
     total_actions = sum(len(a.get("actions", [])) for a in automations)
-    print(f"\n--- Conversion Statistics ---", file=sys.stderr)
-    print(f"Automations converted: {len(automations)}", file=sys.stderr)
-    print(f"Total action blocks:   {total_actions}", file=sys.stderr)
+    print(f"\n{'='*60}", file=sys.stderr)
+    print(f"  CONVERSION AUDIT REPORT", file=sys.stderr)
+    print(f"{'='*60}", file=sys.stderr)
+    print(f"  Total automations:  {s['total']}", file=sys.stderr)
+    print(f"  Total action blocks: {total_actions}", file=sys.stderr)
+    print(f"  Total TODOs:        {s['total_todos']}", file=sys.stderr)
+    print(f"", file=sys.stderr)
+    print(f"  READY   ({s['ready']:3d})  No TODOs — can be imported directly", file=sys.stderr)
+    print(f"  PARTIAL ({s['partial']:3d})  Has real actions but some TODOs to fix", file=sys.stderr)
+    print(f"  MANUAL  ({s['manual']:3d})  Needs significant manual work", file=sys.stderr)
+    print(f"{'='*60}", file=sys.stderr)
+
+    if args.verbose:
+        if audit["ready"]:
+            print(f"\n--- READY (import as-is) ---", file=sys.stderr)
+            for a in audit["ready"]:
+                print(f"  {a['name']}", file=sys.stderr)
+
+        if audit["partial"]:
+            print(f"\n--- PARTIAL (fix TODOs first) ---", file=sys.stderr)
+            for a in audit["partial"]:
+                print(f"  {a['name']}  ({a['todos']} TODOs)", file=sys.stderr)
+
+        if audit["manual"]:
+            print(f"\n--- MANUAL (needs recreation) ---", file=sys.stderr)
+            for a in audit["manual"]:
+                print(f"  {a['name']}  ({a['todos']} TODOs)", file=sys.stderr)
 
 
 if __name__ == "__main__":

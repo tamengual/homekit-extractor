@@ -121,16 +121,23 @@ def compute_match_score(app_auto, homed_auto):
     return score
 
 
-def find_best_matches(app_automations, homed_automations, min_score=0.45):
+def find_best_matches(app_automations, homed_automations, min_score=0.45,
+                      ambiguity_gap=0.05):
     """Match app automations to homed automations using multi-signal scoring.
 
     Uses a greedy approach: for each app automation, finds the highest-scoring
     homed match above min_score.  Each homed automation can only be claimed once.
 
+    Ambiguity detection: if an app automation's best and second-best candidates
+    are within `ambiguity_gap` of each other, the match is flagged as ambiguous
+    and NOT auto-merged.  This prevents silent wrong pairings when several
+    automations have similar names and shapes.
+
     Returns:
         matches: list of (app_idx, homed_idx, score) tuples
         unmatched_app: list of app indices with no match
         unmatched_homed: list of homed indices with no match
+        ambiguous: list of dicts describing refused matches
     """
     # Pre-compute normalized name index for fast candidate filtering
     homed_by_name = {}
@@ -139,8 +146,8 @@ def find_best_matches(app_automations, homed_automations, min_score=0.45):
         if name:
             homed_by_name.setdefault(name, []).append(i)
 
-    # Score all plausible pairs
-    candidates = []
+    # Score all plausible pairs, grouped by app automation
+    scores_by_app = {}  # app_idx -> [(homed_idx, score), ...]
     for app_idx, app_auto in enumerate(app_automations):
         app_name = normalize_name(app_auto.get("name", ""))
 
@@ -156,9 +163,47 @@ def find_best_matches(app_automations, homed_automations, min_score=0.45):
                 if ratio > 0.6:
                     homed_candidates.update(indices)
 
+        pairs = []
         for homed_idx in homed_candidates:
             score = compute_match_score(app_auto, homed_automations[homed_idx])
             if score >= min_score:
+                pairs.append((homed_idx, score))
+
+        if pairs:
+            # Sort descending by score
+            pairs.sort(key=lambda x: x[1], reverse=True)
+            scores_by_app[app_idx] = pairs
+
+    # Detect ambiguity: if top two candidates are within ambiguity_gap,
+    # refuse to auto-merge and flag for manual review.
+    ambiguous = []
+    ambiguous_app_idxs = set()
+
+    for app_idx, pairs in scores_by_app.items():
+        if len(pairs) >= 2:
+            best_score = pairs[0][1]
+            second_score = pairs[1][1]
+            if best_score - second_score < ambiguity_gap:
+                app_name = app_automations[app_idx].get("name", "")
+                ambiguous.append({
+                    "app_name": app_name,
+                    "app_idx": app_idx,
+                    "candidates": [
+                        {
+                            "homed_name": homed_automations[h_idx].get("name", ""),
+                            "homed_idx": h_idx,
+                            "score": round(score, 3),
+                        }
+                        for h_idx, score in pairs[:3]  # Top 3 for context
+                    ],
+                })
+                ambiguous_app_idxs.add(app_idx)
+
+    # Build flat candidate list excluding ambiguous automations
+    candidates = []
+    for app_idx, pairs in scores_by_app.items():
+        if app_idx not in ambiguous_app_idxs:
+            for homed_idx, score in pairs:
                 candidates.append((app_idx, homed_idx, score))
 
     # Greedy assignment: highest scores first, each side claimed at most once
@@ -173,10 +218,13 @@ def find_best_matches(app_automations, homed_automations, min_score=0.45):
             matched_app.add(app_idx)
             matched_homed.add(homed_idx)
 
-    unmatched_app = [i for i in range(len(app_automations)) if i not in matched_app]
+    unmatched_app = [
+        i for i in range(len(app_automations))
+        if i not in matched_app and i not in ambiguous_app_idxs
+    ]
     unmatched_homed = [i for i in range(len(homed_automations)) if i not in matched_homed]
 
-    return matches, unmatched_app, unmatched_homed
+    return matches, unmatched_app, unmatched_homed, ambiguous
 
 
 # ============ CANONICAL MERGE ============
@@ -239,7 +287,7 @@ def merge_exports(app_data, homed_data):
     app_autos = app_data.get("automations", [])
     homed_autos = homed_data.get("automations", [])
 
-    matches, unmatched_app_idxs, unmatched_homed_idxs = find_best_matches(
+    matches, unmatched_app_idxs, unmatched_homed_idxs, ambiguous = find_best_matches(
         app_autos, homed_autos
     )
 
@@ -247,10 +295,12 @@ def merge_exports(app_data, homed_data):
         "app_automations": len(app_autos),
         "homed_automations": len(homed_autos),
         "matched": len(matches),
+        "ambiguous_refused": len(ambiguous),
         "shortcut_workflows_injected": 0,
         "unmatched_app": len(unmatched_app_idxs),
         "unmatched_homed": len(unmatched_homed_idxs),
         "match_details": [],
+        "ambiguous_details": ambiguous,
     }
 
     # Apply merges
@@ -372,9 +422,18 @@ Examples:
     print(f"App export automations:       {stats['app_automations']}", file=sys.stderr)
     print(f"homed export automations:      {stats['homed_automations']}", file=sys.stderr)
     print(f"Matched (multi-signal):       {stats['matched']}", file=sys.stderr)
+    print(f"Ambiguous (refused):          {stats['ambiguous_refused']}", file=sys.stderr)
     print(f"Shortcut workflows injected:  {stats['shortcut_workflows_injected']}", file=sys.stderr)
     print(f"Unmatched (app only):         {stats['unmatched_app']}", file=sys.stderr)
     print(f"Unmatched (homed only):        {stats['unmatched_homed']}", file=sys.stderr)
+
+    # Always print ambiguous matches (these need human attention)
+    if stats.get("ambiguous_details"):
+        print(f"\n--- AMBIGUOUS MATCHES (refused, need manual review) ---", file=sys.stderr)
+        for amb in stats["ambiguous_details"]:
+            print(f"\n  '{amb['app_name']}' has {len(amb['candidates'])} close candidates:", file=sys.stderr)
+            for cand in amb["candidates"]:
+                print(f"    {cand['score']:.3f}  '{cand['homed_name']}'", file=sys.stderr)
 
     if args.verbose and stats.get("match_details"):
         print(f"\n--- Match Details ---", file=sys.stderr)

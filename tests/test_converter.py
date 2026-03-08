@@ -15,6 +15,8 @@ from homekit_to_ha import (
     infer_trigger_from_name,
     convert_trigger,
     convert_characteristic_write,
+    classify_automation,
+    build_audit_report,
 )
 
 
@@ -232,6 +234,136 @@ class TestConvertTrigger(unittest.TestCase):
         triggers = convert_trigger(auto)
         self.assertEqual(len(triggers), 1)
         self.assertEqual(triggers[0]["platform"], "event")
+
+
+class TestClassifyAutomation(unittest.TestCase):
+    """Test that automations are classified correctly based on TODO count and content."""
+
+    def test_ready_no_todos(self):
+        """An automation with real trigger, real actions, and no TODOs is 'ready'."""
+        auto = {
+            "id": "hk_abc123",
+            "alias": "[HK] Living Room Lights Off",
+            "triggers": [{"platform": "time", "at": "23:00:00"}],
+            "actions": [
+                {"service": "light.turn_off", "target": {"entity_id": "light.living_room"}},
+            ],
+        }
+        self.assertEqual(classify_automation(auto), "ready")
+
+    def test_partial_some_todos(self):
+        """An automation with real actions + some TODOs is 'partial'."""
+        auto = {
+            "id": "hk_def456",
+            "alias": "[HK] Bedroom Button Press",
+            "triggers": [{"platform": "event", "event_type": "homekit_button_press",
+                          "event_data": {"device_name": "Bedroom Button", "action": "single_press"}}],
+            "actions": [
+                {"service": "light.turn_on", "target": {"entity_id": "light.bedroom"}},
+                {"service": "scene.turn_on", "target": {"entity_id": "# TODO: Map scene abc123..."}},
+            ],
+        }
+        result = classify_automation(auto)
+        self.assertEqual(result, "partial")
+
+    def test_manual_placeholder_trigger(self):
+        """An automation with a placeholder trigger is 'manual'."""
+        auto = {
+            "id": "hk_ghi789",
+            "alias": "[HK] Mystery Automation",
+            "triggers": [{"platform": "event", "event_type": "manual_trigger_needed",
+                          "_comment": "# TODO: Configure trigger"}],
+            "actions": [
+                {"service": "light.turn_on", "target": {"entity_id": "light.porch"}},
+            ],
+        }
+        self.assertEqual(classify_automation(auto), "manual")
+
+    def test_manual_all_todo_actions(self):
+        """An automation where every action is a TODO is 'manual'."""
+        auto = {
+            "id": "hk_jkl012",
+            "alias": "[HK] Shortcut Only",
+            "triggers": [{"platform": "time", "at": "08:00:00"}],
+            "actions": [
+                {"_comment": "# TODO: Unsupported action type: shortcut"},
+            ],
+        }
+        self.assertEqual(classify_automation(auto), "manual")
+
+    def test_ready_multiple_real_actions(self):
+        """An automation with multiple real actions and no TODOs is 'ready'."""
+        auto = {
+            "id": "hk_mno345",
+            "alias": "[HK] Goodnight Scene",
+            "triggers": [{"platform": "time", "at": "22:30:00"}],
+            "actions": [
+                {"service": "light.turn_off", "target": {"entity_id": "light.living_room"}},
+                {"service": "light.turn_off", "target": {"entity_id": "light.kitchen"}},
+                {"service": "cover.close_cover", "target": {"entity_id": "cover.blinds"}},
+            ],
+        }
+        self.assertEqual(classify_automation(auto), "ready")
+
+
+class TestBuildAuditReport(unittest.TestCase):
+    """Test that the audit report aggregates correctly."""
+
+    def test_report_structure(self):
+        automations = [
+            {"alias": "Auto A", "actions": [{"service": "light.turn_on", "target": {"entity_id": "light.a"}}]},
+            {"alias": "Auto B", "actions": [{"service": "# TODO: Add actions"}]},
+        ]
+        classifications = ["ready", "manual"]
+        report = build_audit_report(automations, classifications)
+
+        self.assertIn("summary", report)
+        self.assertEqual(report["summary"]["ready"], 1)
+        self.assertEqual(report["summary"]["manual"], 1)
+        self.assertEqual(report["summary"]["partial"], 0)
+        self.assertEqual(report["summary"]["total"], 2)
+
+    def test_todo_counting(self):
+        auto_with_todos = {
+            "alias": "Has TODOs",
+            "actions": [
+                {"service": "light.turn_on", "target": {"entity_id": "# TODO: Map entity"}},
+                {"_comment": "# TODO: Unsupported action"},
+            ],
+        }
+        auto_no_todos = {
+            "alias": "Clean",
+            "actions": [{"service": "light.turn_off", "target": {"entity_id": "light.bedroom"}}],
+        }
+        report = build_audit_report(
+            [auto_with_todos, auto_no_todos],
+            ["partial", "ready"],
+        )
+        self.assertGreater(report["summary"]["total_todos"], 0)
+        # The clean one should have 0 TODOs
+        ready_entry = report["ready"][0]
+        self.assertEqual(ready_entry["todos"], 0)
+
+    def test_empty_input(self):
+        report = build_audit_report([], [])
+        self.assertEqual(report["summary"]["total"], 0)
+        self.assertEqual(report["summary"]["ready"], 0)
+        self.assertEqual(len(report["ready"]), 0)
+        self.assertEqual(len(report["partial"]), 0)
+        self.assertEqual(len(report["manual"]), 0)
+
+    def test_all_partial(self):
+        autos = [
+            {"alias": f"Auto {i}", "actions": [
+                {"service": "light.turn_on", "target": {"entity_id": "light.ok"}},
+                {"_comment": "# TODO: fix this"},
+            ]}
+            for i in range(3)
+        ]
+        report = build_audit_report(autos, ["partial"] * 3)
+        self.assertEqual(report["summary"]["partial"], 3)
+        self.assertEqual(report["summary"]["ready"], 0)
+        self.assertEqual(report["summary"]["manual"], 0)
 
 
 if __name__ == "__main__":

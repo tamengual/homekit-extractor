@@ -32,12 +32,12 @@ A Python script that reads Apple's internal HomeKit daemon database (`~/Library/
 - Target values (via NSKeyedArchiver-encoded binary plists)
 - Trigger events with full characteristic references
 
-### Method 3: Home Assistant Conversion
-Python scripts that combine both exports and convert everything to Home Assistant automation YAML:
-- Entity mapping from HomeKit accessory names to HA entity IDs
+### Method 3: Home Assistant Conversion (best-effort)
+Python scripts that combine both exports and produce Home Assistant automation YAML **as a starting point**. Every automation gets a readiness classification (READY / PARTIAL / MANUAL) and `# TODO` annotations where manual work is needed:
+- Entity mapping from HomeKit accessory names to HA entity IDs (fuzzy — verify all matches)
 - Characteristic-to-service-call translation (brightness, color, temperature, etc.)
 - Conditional logic preservation (toggle patterns, if/else branches)
-- Party mode / occupancy conditions
+- Audit report showing how many automations are import-ready vs. need editing
 
 ## Quick Start
 
@@ -71,7 +71,7 @@ python3 merge_exports.py \
   -o homekit_merged.json
 ```
 
-### Step 4: Convert to Home Assistant (Optional)
+### Step 4: Convert to Home Assistant (Optional — requires manual review)
 ```bash
 # First, get your HA entity registry
 # (copy /config/.storage/core.entity_registry from your HA instance)
@@ -82,11 +82,14 @@ python3 homekit_to_ha.py \
   -o homekit_automations.yaml
 ```
 
-> **Note:** The converter produces automation YAML with `# TODO` comments wherever
-> manual intervention is needed — entity IDs that couldn't be mapped, button
-> triggers that need device-specific configuration, and shortcut actions whose
-> scene references couldn't be resolved.  Expect to review and edit every
-> automation before importing into Home Assistant.
+> **Important:** The converter is **not** a push-button migration tool. It produces
+> automation YAML with `# TODO` comments wherever manual intervention is needed —
+> entity IDs that couldn't be mapped, button triggers that need device-specific
+> configuration, and shortcut actions whose scene references couldn't be resolved.
+> The audit report printed at the end classifies each automation as READY, PARTIAL,
+> or MANUAL. Even "READY" automations should be reviewed before importing — the
+> entity mapping is fuzzy and may produce incorrect matches.  **Do not disable
+> HomeKit until you've verified every converted automation works in HA.**
 
 ## Project Structure
 
