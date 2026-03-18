@@ -1167,7 +1167,10 @@ def main():
         with open(args.entity_map, "r") as f:
             manual_map = json.load(f)
         def entity_lookup(name, room, service):
-            return manual_map.get(name, (None, "no_map"))
+            eid = manual_map.get(name)
+            if eid:
+                return eid, "MANUAL_MAP"
+            return None, "UNMATCHED"
     else:
         print("Warning: No entity mapping provided. Entity IDs will be TODOs.", file=sys.stderr)
         def entity_lookup(name, room, service):
