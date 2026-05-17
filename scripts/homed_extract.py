@@ -61,6 +61,12 @@ import uuid as uuid_mod
 COREDATA_EPOCH_OFFSET = 978307200
 
 # Z_ENT values from the Z_PRIMARYKEY table.
+#
+# These shift across macOS versions when Apple bumps the homed CoreData
+# model (e.g. on macOS 26 Tahoe, MKFTrigger moved from 135 -> 136 and the
+# trigger subclasses shifted with it). The constants below are kept as
+# documentation of historical defaults; the actual values used at runtime
+# are discovered from Z_PRIMARYKEY via _load_entity_ids() in extract().
 ENT_CHARACTERISTIC_WRITE = 36
 ENT_MATTER_COMMAND = 37
 ENT_MEDIA_PLAYBACK = 38
@@ -78,7 +84,34 @@ ENT_SIGNIFICANT_TIME_EVENT = 97
 ENT_EVENT_TRIGGER = 136
 ENT_TIMER_TRIGGER = 137
 
-# Friendly names for entity types.
+# Entity-class-name -> friendly type-string. Stable across macOS versions
+# (Apple renames entity classes very rarely). At runtime these are joined
+# against the {name: Z_ENT} map from Z_PRIMARYKEY to build the dispatch
+# dicts ACTION_ENT_NAMES / EVENT_ENT_NAMES / TRIGGER_ENT_NAMES below.
+_ACTION_CLASS_NAMES = {
+    "MKFCharacteristicWriteAction": "characteristicWrite",
+    "MKFMatterCommandAction": "matterCommand",
+    "MKFMediaPlaybackAction": "mediaPlayback",
+    "MKFNaturalLightingAction": "naturalLighting",
+    "MKFShortcutAction": "shortcut",
+}
+_EVENT_CLASS_NAMES = {
+    "MKFCalendarEvent": "calendar",
+    "MKFCharacteristicRangeEvent": "charRange",
+    "MKFCharacteristicValueEvent": "charValue",
+    "MKFDurationEvent": "duration",
+    "MKFLocationEvent": "location",
+    "MKFPresenceEvent": "presence",
+    "MKFSignificantTimeEvent": "significantTime",
+}
+_TRIGGER_CLASS_NAMES = {
+    "MKFEventTrigger": "event",
+    "MKFTimerTrigger": "timer",
+}
+
+# Friendly names for entity types. Populated at runtime by
+# _rebuild_ent_maps() in extract(); seeded with the historical defaults
+# above so module-level imports remain valid for tooling/tests.
 ACTION_ENT_NAMES = {
     ENT_CHARACTERISTIC_WRITE: "characteristicWrite",
     ENT_MATTER_COMMAND: "matterCommand",
@@ -101,6 +134,37 @@ TRIGGER_ENT_NAMES = {
     ENT_EVENT_TRIGGER: "event",
     ENT_TIMER_TRIGGER: "timer",
 }
+
+
+def _load_entity_ids(cur) -> dict:
+    """Load Z_PRIMARYKEY into a {entity_class_name: Z_ENT} map.
+
+    CoreData entity IDs (Z_ENT) shift across macOS versions when Apple
+    bumps the homed model. Discovering them at runtime keeps the script
+    working without per-OS patches.
+    """
+    cur.execute("SELECT Z_NAME, Z_ENT FROM Z_PRIMARYKEY")
+    return {row[0]: row[1] for row in cur.fetchall()}
+
+
+def _rebuild_ent_maps(entity_ids: dict) -> None:
+    """Rebuild the module-level *_ENT_NAMES dicts from runtime IDs."""
+    global ACTION_ENT_NAMES, EVENT_ENT_NAMES, TRIGGER_ENT_NAMES
+    ACTION_ENT_NAMES = {
+        entity_ids[n]: short
+        for n, short in _ACTION_CLASS_NAMES.items()
+        if n in entity_ids
+    }
+    EVENT_ENT_NAMES = {
+        entity_ids[n]: short
+        for n, short in _EVENT_CLASS_NAMES.items()
+        if n in entity_ids
+    }
+    TRIGGER_ENT_NAMES = {
+        entity_ids[n]: short
+        for n, short in _TRIGGER_CLASS_NAMES.items()
+        if n in entity_ids
+    }
 
 # WFCondition lookup (Shortcuts conditional operators).
 WF_CONDITIONS = {
@@ -641,6 +705,27 @@ def extract(db_path: str, verbose: bool = False) -> dict:
         raise
     cur = conn.cursor()
 
+    # -- Discover CoreData entity IDs ---------------------------------------
+    # These shift across macOS versions; load from Z_PRIMARYKEY rather than
+    # trusting hard-coded values.
+    entity_ids = _load_entity_ids(cur)
+    _rebuild_ent_maps(entity_ids)
+    try:
+        actionset_ent_id = entity_ids["MKFActionSet"]
+        trigger_ent_id = entity_ids["MKFTrigger"]
+    except KeyError as exc:
+        raise RuntimeError(
+            f"Required CoreData entity missing from Z_PRIMARYKEY: {exc.args[0]}. "
+            f"Tahoe expects MKFActionSet and MKFTrigger; this schema is unknown."
+        ) from exc
+
+    if verbose:
+        print(
+            f"[*] CoreData entity IDs discovered: MKFActionSet={actionset_ent_id}, "
+            f"MKFTrigger={trigger_ent_id}",
+            file=sys.stderr,
+        )
+
     # -- Build lookup tables ------------------------------------------------
     if verbose:
         print("[*] Building lookup tables ...", file=sys.stderr)
@@ -712,14 +797,16 @@ def extract(db_path: str, verbose: bool = False) -> dict:
         # Events (trigger conditions)
         auto["events"] = _extract_events(cur, t_pk, char_info, svc_names)
 
-        # Action sets via the junction table Z_41TRIGGERS_.
-        # Column Z_41ACTIONSETS_  -> ZMKFACTIONSET.Z_PK
-        # Column Z_135TRIGGERS_   -> ZMKFTRIGGER.Z_PK
+        # Action sets via the junction table Z_<actionset_ent>TRIGGERS_.
+        # Column Z_<actionset_ent>ACTIONSETS_ -> ZMKFACTIONSET.Z_PK
+        # Column Z_<trigger_ent>TRIGGERS_     -> ZMKFTRIGGER.Z_PK
+        # Entity IDs are discovered at runtime (see _load_entity_ids).
         cur.execute(
-            "SELECT aset.Z_PK, aset.ZNAME, aset.ZTYPE "
-            "FROM Z_41TRIGGERS_ jt "
-            "JOIN ZMKFACTIONSET aset ON jt.Z_41ACTIONSETS_ = aset.Z_PK "
-            "WHERE jt.Z_135TRIGGERS_ = ?",
+            f"SELECT aset.Z_PK, aset.ZNAME, aset.ZTYPE "
+            f"FROM Z_{actionset_ent_id}TRIGGERS_ jt "
+            f"JOIN ZMKFACTIONSET aset "
+            f"  ON jt.Z_{actionset_ent_id}ACTIONSETS_ = aset.Z_PK "
+            f"WHERE jt.Z_{trigger_ent_id}TRIGGERS_ = ?",
             (t_pk,),
         )
 
