@@ -460,6 +460,41 @@ def _build_accessory_lookup(
     return lookup
 
 
+def _dump_inventory(cur: sqlite3.Cursor, rooms: dict[int, str]) -> list[dict]:
+    """Full accessory inventory: name, make/model, uuid, room, plus serial
+    number and bridge linkage when the schema version carries those columns."""
+    cur.execute('PRAGMA table_info("ZMKFACCESSORY")')
+    cols = {row[1] for row in cur.fetchall()}
+    extra = [c for c in ("ZSERIALNUMBER", "ZBRIDGE", "ZFIRMWAREVERSION") if c in cols]
+    sel = "Z_PK, ZCONFIGUREDNAME, ZMANUFACTURER, ZMODEL, ZUNIQUEIDENTIFIER, ZROOM"
+    if extra:
+        sel += ", " + ", ".join(extra)
+    cur.execute(f"SELECT {sel} FROM ZMKFACCESSORY")
+    row_pk_name: dict[int, str] = {}
+    raw = cur.fetchall()
+    for row in raw:
+        row_pk_name[row[0]] = row[1] or ""
+    inventory = []
+    for row in raw:
+        pk, name, mfr, model, uid, room_pk = row[:6]
+        item = {
+            "name": name,
+            "manufacturer": mfr,
+            "model": model,
+            "uuid": uid,
+            "room": rooms.get(room_pk, "") if room_pk else "",
+        }
+        for col, val in zip(extra, row[6:]):
+            if col == "ZBRIDGE":
+                item["bridge"] = row_pk_name.get(val, "") if val else ""
+            elif col == "ZSERIALNUMBER":
+                item["serialNumber"] = val
+            elif col == "ZFIRMWAREVERSION":
+                item["firmwareVersion"] = val
+        inventory.append(item)
+    return inventory
+
+
 def _build_service_lookup(
     cur: sqlite3.Cursor, accessories: dict[int, dict]
 ) -> dict[int, dict]:
@@ -618,6 +653,36 @@ def _extract_actions(
 # Main extraction logic
 # ---------------------------------------------------------------------------
 
+_TRIGGER_JOIN: tuple[str, str, str] | None = None
+
+
+def _trigger_join(cur: sqlite3.Cursor) -> tuple[str, str, str]:
+    """Locate the CoreData join table linking triggers to action sets.
+
+    Its name and column prefixes (e.g. Z_41TRIGGERS_ / Z_135TRIGGERS_) are
+    auto-numbered by CoreData and vary across macOS schema versions, so
+    discover them from the live schema instead of hardcoding.
+    """
+    global _TRIGGER_JOIN
+    if _TRIGGER_JOIN is None:
+        cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Z\\_%' ESCAPE '\\'"
+        )
+        for (tbl,) in cur.fetchall():
+            cur.execute(f'PRAGMA table_info("{tbl}")')
+            cols = [row[1] for row in cur.fetchall()]
+            trig = next((c for c in cols if c.rstrip("_").endswith("TRIGGERS")), None)
+            aset = next((c for c in cols if c.rstrip("_").endswith("ACTIONSETS")), None)
+            if trig and aset and len(cols) <= 4:
+                _TRIGGER_JOIN = (tbl, aset, trig)
+                break
+        if _TRIGGER_JOIN is None:
+            raise RuntimeError(
+                "Could not locate the trigger/actionset join table in this schema"
+            )
+    return _TRIGGER_JOIN
+
+
 def extract(db_path: str, verbose: bool = False) -> dict:
     """Open *db_path* read-only and return the full extraction dict."""
 
@@ -712,14 +777,14 @@ def extract(db_path: str, verbose: bool = False) -> dict:
         # Events (trigger conditions)
         auto["events"] = _extract_events(cur, t_pk, char_info, svc_names)
 
-        # Action sets via the junction table Z_41TRIGGERS_.
-        # Column Z_41ACTIONSETS_  -> ZMKFACTIONSET.Z_PK
-        # Column Z_135TRIGGERS_   -> ZMKFTRIGGER.Z_PK
+        # Action sets via the trigger/actionset junction table. Its name and
+        # column prefixes are schema-version-dependent — discovered at runtime.
+        jt_tbl, jt_aset_col, jt_trig_col = _trigger_join(cur)
         cur.execute(
-            "SELECT aset.Z_PK, aset.ZNAME, aset.ZTYPE "
-            "FROM Z_41TRIGGERS_ jt "
-            "JOIN ZMKFACTIONSET aset ON jt.Z_41ACTIONSETS_ = aset.Z_PK "
-            "WHERE jt.Z_135TRIGGERS_ = ?",
+            f'SELECT aset.Z_PK, aset.ZNAME, aset.ZTYPE '
+            f'FROM "{jt_tbl}" jt '
+            f'JOIN ZMKFACTIONSET aset ON jt."{jt_aset_col}" = aset.Z_PK '
+            f'WHERE jt."{jt_trig_col}" = ?',
             (t_pk,),
         )
 
@@ -750,6 +815,7 @@ def extract(db_path: str, verbose: bool = False) -> dict:
 
         all_automations.append(auto)
 
+    inventory = _dump_inventory(cur, rooms)
     conn.close()
 
     # -- Compute summary stats ----------------------------------------------
@@ -793,6 +859,8 @@ def extract(db_path: str, verbose: bool = False) -> dict:
             "services": len(svc_names),
             "characteristics": len(char_info),
         },
+        "rooms": sorted(r for r in rooms.values() if r),
+        "accessories": inventory,
         "automations": all_automations,
     }
     return output
