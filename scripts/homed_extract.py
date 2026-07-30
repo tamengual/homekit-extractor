@@ -61,6 +61,12 @@ import uuid as uuid_mod
 COREDATA_EPOCH_OFFSET = 978307200
 
 # Z_ENT values from the Z_PRIMARYKEY table.
+#
+# These shift across macOS versions when Apple bumps the homed CoreData
+# model (e.g. on macOS 26 Tahoe, MKFTrigger moved from 135 -> 136 and the
+# trigger subclasses shifted with it). The constants below are kept as
+# documentation of historical defaults; the *_ENT_NAMES dicts are rebuilt
+# at runtime from Z_PRIMARYKEY via _rebuild_ent_name_maps() in extract().
 ENT_CHARACTERISTIC_WRITE = 36
 ENT_MATTER_COMMAND = 37
 ENT_MEDIA_PLAYBACK = 38
@@ -101,6 +107,62 @@ TRIGGER_ENT_NAMES = {
     ENT_EVENT_TRIGGER: "event",
     ENT_TIMER_TRIGGER: "timer",
 }
+
+# Entity-class-name -> friendly type-string. Stable across macOS versions
+# (Apple renames entity classes very rarely, unlike their numeric Z_ENT
+# ids). Joined against the {name: Z_ENT} map from Z_PRIMARYKEY at runtime
+# to rebuild the *_ENT_NAMES dicts above for the current schema.
+_ACTION_CLASS_NAMES = {
+    "MKFCharacteristicWriteAction": "characteristicWrite",
+    "MKFMatterCommandAction": "matterCommand",
+    "MKFMediaPlaybackAction": "mediaPlayback",
+    "MKFNaturalLightingAction": "naturalLighting",
+    "MKFShortcutAction": "shortcut",
+}
+_EVENT_CLASS_NAMES = {
+    "MKFCalendarEvent": "calendar",
+    "MKFCharacteristicRangeEvent": "charRange",
+    "MKFCharacteristicValueEvent": "charValue",
+    "MKFDurationEvent": "duration",
+    "MKFLocationEvent": "location",
+    "MKFPresenceEvent": "presence",
+    "MKFSignificantTimeEvent": "significantTime",
+}
+_TRIGGER_CLASS_NAMES = {
+    "MKFEventTrigger": "event",
+    "MKFTimerTrigger": "timer",
+}
+
+
+def _load_entity_ids(cur: sqlite3.Cursor) -> dict[str, int]:
+    """Load Z_PRIMARYKEY into a {entity_class_name: Z_ENT} map.
+
+    CoreData entity ids (Z_ENT) shift across macOS versions when Apple
+    bumps the homed model. Discovering them at runtime keeps the action/
+    event/trigger type labels correct without per-OS patches.
+    """
+    cur.execute("SELECT Z_NAME, Z_ENT FROM Z_PRIMARYKEY")
+    return {row[0]: row[1] for row in cur.fetchall()}
+
+
+def _rebuild_ent_name_maps(entity_ids: dict[str, int]) -> None:
+    """Rebuild the module-level *_ENT_NAMES dicts from runtime Z_ENT ids."""
+    global ACTION_ENT_NAMES, EVENT_ENT_NAMES, TRIGGER_ENT_NAMES
+    ACTION_ENT_NAMES = {
+        entity_ids[name]: label
+        for name, label in _ACTION_CLASS_NAMES.items()
+        if name in entity_ids
+    }
+    EVENT_ENT_NAMES = {
+        entity_ids[name]: label
+        for name, label in _EVENT_CLASS_NAMES.items()
+        if name in entity_ids
+    }
+    TRIGGER_ENT_NAMES = {
+        entity_ids[name]: label
+        for name, label in _TRIGGER_CLASS_NAMES.items()
+        if name in entity_ids
+    }
 
 # WFCondition lookup (Shortcuts conditional operators).
 WF_CONDITIONS = {
@@ -460,6 +522,41 @@ def _build_accessory_lookup(
     return lookup
 
 
+def _dump_inventory(cur: sqlite3.Cursor, rooms: dict[int, str]) -> list[dict]:
+    """Full accessory inventory: name, make/model, uuid, room, plus serial
+    number and bridge linkage when the schema version carries those columns."""
+    cur.execute('PRAGMA table_info("ZMKFACCESSORY")')
+    cols = {row[1] for row in cur.fetchall()}
+    extra = [c for c in ("ZSERIALNUMBER", "ZBRIDGE", "ZFIRMWAREVERSION") if c in cols]
+    sel = "Z_PK, ZCONFIGUREDNAME, ZMANUFACTURER, ZMODEL, ZUNIQUEIDENTIFIER, ZROOM"
+    if extra:
+        sel += ", " + ", ".join(extra)
+    cur.execute(f"SELECT {sel} FROM ZMKFACCESSORY")
+    row_pk_name: dict[int, str] = {}
+    raw = cur.fetchall()
+    for row in raw:
+        row_pk_name[row[0]] = row[1] or ""
+    inventory = []
+    for row in raw:
+        pk, name, mfr, model, uid, room_pk = row[:6]
+        item = {
+            "name": name,
+            "manufacturer": mfr,
+            "model": model,
+            "uuid": uid,
+            "room": rooms.get(room_pk, "") if room_pk else "",
+        }
+        for col, val in zip(extra, row[6:]):
+            if col == "ZBRIDGE":
+                item["bridge"] = row_pk_name.get(val, "") if val else ""
+            elif col == "ZSERIALNUMBER":
+                item["serialNumber"] = val
+            elif col == "ZFIRMWAREVERSION":
+                item["firmwareVersion"] = val
+        inventory.append(item)
+    return inventory
+
+
 def _build_service_lookup(
     cur: sqlite3.Cursor, accessories: dict[int, dict]
 ) -> dict[int, dict]:
@@ -618,6 +715,36 @@ def _extract_actions(
 # Main extraction logic
 # ---------------------------------------------------------------------------
 
+_TRIGGER_JOIN: tuple[str, str, str] | None = None
+
+
+def _trigger_join(cur: sqlite3.Cursor) -> tuple[str, str, str]:
+    """Locate the CoreData join table linking triggers to action sets.
+
+    Its name and column prefixes (e.g. Z_41TRIGGERS_ / Z_135TRIGGERS_) are
+    auto-numbered by CoreData and vary across macOS schema versions, so
+    discover them from the live schema instead of hardcoding.
+    """
+    global _TRIGGER_JOIN
+    if _TRIGGER_JOIN is None:
+        cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Z\\_%' ESCAPE '\\'"
+        )
+        for (tbl,) in cur.fetchall():
+            cur.execute(f'PRAGMA table_info("{tbl}")')
+            cols = [row[1] for row in cur.fetchall()]
+            trig = next((c for c in cols if c.rstrip("_").endswith("TRIGGERS")), None)
+            aset = next((c for c in cols if c.rstrip("_").endswith("ACTIONSETS")), None)
+            if trig and aset and len(cols) <= 4:
+                _TRIGGER_JOIN = (tbl, aset, trig)
+                break
+        if _TRIGGER_JOIN is None:
+            raise RuntimeError(
+                "Could not locate the trigger/actionset join table in this schema"
+            )
+    return _TRIGGER_JOIN
+
+
 def extract(db_path: str, verbose: bool = False) -> dict:
     """Open *db_path* read-only and return the full extraction dict."""
 
@@ -640,6 +767,12 @@ def extract(db_path: str, verbose: bool = False) -> dict:
             ) from exc
         raise
     cur = conn.cursor()
+
+    # -- Rebuild entity-id -> type-label maps --------------------------------
+    # Z_ENT ids drift across macOS schema versions; rederive them from the
+    # live Z_PRIMARYKEY table so action/event/trigger type labels stay
+    # correct instead of silently falling back to "ent_<n>"/"type_<n>".
+    _rebuild_ent_name_maps(_load_entity_ids(cur))
 
     # -- Build lookup tables ------------------------------------------------
     if verbose:
@@ -712,14 +845,14 @@ def extract(db_path: str, verbose: bool = False) -> dict:
         # Events (trigger conditions)
         auto["events"] = _extract_events(cur, t_pk, char_info, svc_names)
 
-        # Action sets via the junction table Z_41TRIGGERS_.
-        # Column Z_41ACTIONSETS_  -> ZMKFACTIONSET.Z_PK
-        # Column Z_135TRIGGERS_   -> ZMKFTRIGGER.Z_PK
+        # Action sets via the trigger/actionset junction table. Its name and
+        # column prefixes are schema-version-dependent — discovered at runtime.
+        jt_tbl, jt_aset_col, jt_trig_col = _trigger_join(cur)
         cur.execute(
-            "SELECT aset.Z_PK, aset.ZNAME, aset.ZTYPE "
-            "FROM Z_41TRIGGERS_ jt "
-            "JOIN ZMKFACTIONSET aset ON jt.Z_41ACTIONSETS_ = aset.Z_PK "
-            "WHERE jt.Z_135TRIGGERS_ = ?",
+            f'SELECT aset.Z_PK, aset.ZNAME, aset.ZTYPE '
+            f'FROM "{jt_tbl}" jt '
+            f'JOIN ZMKFACTIONSET aset ON jt."{jt_aset_col}" = aset.Z_PK '
+            f'WHERE jt."{jt_trig_col}" = ?',
             (t_pk,),
         )
 
@@ -750,6 +883,7 @@ def extract(db_path: str, verbose: bool = False) -> dict:
 
         all_automations.append(auto)
 
+    inventory = _dump_inventory(cur, rooms)
     conn.close()
 
     # -- Compute summary stats ----------------------------------------------
@@ -793,6 +927,8 @@ def extract(db_path: str, verbose: bool = False) -> dict:
             "services": len(svc_names),
             "characteristics": len(char_info),
         },
+        "rooms": sorted(r for r in rooms.values() if r),
+        "accessories": inventory,
         "automations": all_automations,
     }
     return output

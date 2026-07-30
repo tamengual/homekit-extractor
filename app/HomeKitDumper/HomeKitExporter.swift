@@ -172,9 +172,12 @@ class HomeKitExporter: NSObject, ObservableObject, HMHomeManagerDelegate {
 
             if let metadata = char.metadata {
                 var meta: [String: Any] = [:]
-                if let min = metadata.minimumValue { meta["minimumValue"] = min }
-                if let max = metadata.maximumValue { meta["maximumValue"] = max }
-                if let step = metadata.stepValue { meta["stepValue"] = step }
+                // Sanitize numeric metadata — some accessories report ±Inf or
+                // NaN for min/max/step (e.g., unbounded power-meter ranges)
+                // which crashes NSJSONSerialization.
+                if let min = metadata.minimumValue { meta["minimumValue"] = sanitizeNumber(min) }
+                if let max = metadata.maximumValue { meta["maximumValue"] = sanitizeNumber(max) }
+                if let step = metadata.stepValue { meta["stepValue"] = sanitizeNumber(step) }
                 if let units = metadata.units { meta["units"] = units }
                 if let format = metadata.format { meta["format"] = format }
                 if let maxLen = metadata.maxLength { meta["maxLength"] = maxLen }
@@ -656,10 +659,7 @@ class HomeKitExporter: NSObject, ObservableObject, HMHomeManagerDelegate {
     private func sanitizeValueDeep(_ value: Any) -> Any {
         switch value {
         case let num as NSNumber:
-            if CFBooleanGetTypeID() == CFGetTypeID(num) {
-                return num.boolValue
-            }
-            return num
+            return sanitizeNumber(num)
         case let str as String:
             return str
         case let uuid as UUID:
@@ -820,15 +820,26 @@ class HomeKitExporter: NSObject, ObservableObject, HMHomeManagerDelegate {
         return dict
     }
 
+    /// Sanitize an NSNumber for JSON: bools stay bool, finite numbers pass
+    /// through, non-finite (Infinity/-Infinity/NaN) become NSNull because
+    /// NSJSONSerialization throws on them. HomeKit characteristic metadata
+    /// frequently reports +Inf as "unbounded" for min/max/step.
+    private func sanitizeNumber(_ num: NSNumber) -> Any {
+        if CFBooleanGetTypeID() == CFGetTypeID(num) {
+            return num.boolValue
+        }
+        let d = num.doubleValue
+        if d.isNaN || d.isInfinite {
+            return NSNull()
+        }
+        return num
+    }
+
     /// Converts any value into a JSON-safe type.
     private func sanitizeValue(_ value: Any) -> Any {
         switch value {
         case let num as NSNumber:
-            // Distinguish booleans from other numbers
-            if CFBooleanGetTypeID() == CFGetTypeID(num) {
-                return num.boolValue
-            }
-            return num
+            return sanitizeNumber(num)
         case let str as String:
             return str
         case let data as Data:
