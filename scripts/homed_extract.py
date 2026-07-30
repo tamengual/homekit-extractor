@@ -61,6 +61,12 @@ import uuid as uuid_mod
 COREDATA_EPOCH_OFFSET = 978307200
 
 # Z_ENT values from the Z_PRIMARYKEY table.
+#
+# These shift across macOS versions when Apple bumps the homed CoreData
+# model (e.g. on macOS 26 Tahoe, MKFTrigger moved from 135 -> 136 and the
+# trigger subclasses shifted with it). The constants below are kept as
+# documentation of historical defaults; the *_ENT_NAMES dicts are rebuilt
+# at runtime from Z_PRIMARYKEY via _rebuild_ent_name_maps() in extract().
 ENT_CHARACTERISTIC_WRITE = 36
 ENT_MATTER_COMMAND = 37
 ENT_MEDIA_PLAYBACK = 38
@@ -101,6 +107,62 @@ TRIGGER_ENT_NAMES = {
     ENT_EVENT_TRIGGER: "event",
     ENT_TIMER_TRIGGER: "timer",
 }
+
+# Entity-class-name -> friendly type-string. Stable across macOS versions
+# (Apple renames entity classes very rarely, unlike their numeric Z_ENT
+# ids). Joined against the {name: Z_ENT} map from Z_PRIMARYKEY at runtime
+# to rebuild the *_ENT_NAMES dicts above for the current schema.
+_ACTION_CLASS_NAMES = {
+    "MKFCharacteristicWriteAction": "characteristicWrite",
+    "MKFMatterCommandAction": "matterCommand",
+    "MKFMediaPlaybackAction": "mediaPlayback",
+    "MKFNaturalLightingAction": "naturalLighting",
+    "MKFShortcutAction": "shortcut",
+}
+_EVENT_CLASS_NAMES = {
+    "MKFCalendarEvent": "calendar",
+    "MKFCharacteristicRangeEvent": "charRange",
+    "MKFCharacteristicValueEvent": "charValue",
+    "MKFDurationEvent": "duration",
+    "MKFLocationEvent": "location",
+    "MKFPresenceEvent": "presence",
+    "MKFSignificantTimeEvent": "significantTime",
+}
+_TRIGGER_CLASS_NAMES = {
+    "MKFEventTrigger": "event",
+    "MKFTimerTrigger": "timer",
+}
+
+
+def _load_entity_ids(cur: sqlite3.Cursor) -> dict[str, int]:
+    """Load Z_PRIMARYKEY into a {entity_class_name: Z_ENT} map.
+
+    CoreData entity ids (Z_ENT) shift across macOS versions when Apple
+    bumps the homed model. Discovering them at runtime keeps the action/
+    event/trigger type labels correct without per-OS patches.
+    """
+    cur.execute("SELECT Z_NAME, Z_ENT FROM Z_PRIMARYKEY")
+    return {row[0]: row[1] for row in cur.fetchall()}
+
+
+def _rebuild_ent_name_maps(entity_ids: dict[str, int]) -> None:
+    """Rebuild the module-level *_ENT_NAMES dicts from runtime Z_ENT ids."""
+    global ACTION_ENT_NAMES, EVENT_ENT_NAMES, TRIGGER_ENT_NAMES
+    ACTION_ENT_NAMES = {
+        entity_ids[name]: label
+        for name, label in _ACTION_CLASS_NAMES.items()
+        if name in entity_ids
+    }
+    EVENT_ENT_NAMES = {
+        entity_ids[name]: label
+        for name, label in _EVENT_CLASS_NAMES.items()
+        if name in entity_ids
+    }
+    TRIGGER_ENT_NAMES = {
+        entity_ids[name]: label
+        for name, label in _TRIGGER_CLASS_NAMES.items()
+        if name in entity_ids
+    }
 
 # WFCondition lookup (Shortcuts conditional operators).
 WF_CONDITIONS = {
@@ -705,6 +767,12 @@ def extract(db_path: str, verbose: bool = False) -> dict:
             ) from exc
         raise
     cur = conn.cursor()
+
+    # -- Rebuild entity-id -> type-label maps --------------------------------
+    # Z_ENT ids drift across macOS schema versions; rederive them from the
+    # live Z_PRIMARYKEY table so action/event/trigger type labels stay
+    # correct instead of silently falling back to "ent_<n>"/"type_<n>".
+    _rebuild_ent_name_maps(_load_entity_ids(cur))
 
     # -- Build lookup tables ------------------------------------------------
     if verbose:
