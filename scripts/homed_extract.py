@@ -446,8 +446,8 @@ def _build_accessory_lookup(
     """Z_PK -> {name, manufacturer, model, uuid, room}."""
     lookup: dict[int, dict] = {}
     cur.execute(
-        "SELECT Z_PK, ZCONFIGUREDNAME, ZMANUFACTURER, ZMODEL, "
-        "ZUNIQUEIDENTIFIER, ZROOM FROM ZMKFACCESSORY"
+        "SELECT Z_PK, COALESCE(NULLIF(ZCONFIGUREDNAME, ''), ZPROVIDEDNAME), "
+        "ZMANUFACTURER, ZMODEL, ZUNIQUEIDENTIFIER, ZROOM FROM ZMKFACCESSORY"
     )
     for pk, name, mfr, model, uid, room_pk in cur.fetchall():
         lookup[pk] = {
@@ -479,14 +479,27 @@ def _build_service_lookup(
 
 def _build_characteristic_lookup(
     cur: sqlite3.Cursor, services: dict[int, dict]
-) -> dict[int, dict]:
-    """Z_PK -> {type, service, accessory, description, format}."""
-    lookup: dict[int, dict] = {}
+) -> tuple[dict[int, dict], dict[tuple[int, int], dict]]:
+    """Build both characteristic lookups.
+
+    Returns ``(by_pk, by_instance)`` where ``by_pk`` is keyed by
+    ``ZMKFCHARACTERISTIC.Z_PK`` and ``by_instance`` by
+    ``(ZSERVICE, ZINSTANCEID)``.
+
+    ``by_instance`` is the one that events and actions need.  Despite the
+    name, ``ZMKFEVENT.ZCHARACTERISTICID`` and ``ZMKFACTION.ZCHARACTERISTICID``
+    are **not** foreign keys into this table -- they are HomeKit instance ids,
+    which are unique only within a service.  That is why those rows carry a
+    ``ZSERVICE`` column alongside.  ``(ZSERVICE, ZINSTANCEID)`` is unique
+    across the table.
+    """
+    by_pk: dict[int, dict] = {}
+    by_instance: dict[tuple[int, int], dict] = {}
     cur.execute(
-        "SELECT Z_PK, ZTYPE, ZSERVICE, ZMANUFACTURERDESCRIPTION, ZFORMAT "
-        "FROM ZMKFCHARACTERISTIC"
+        "SELECT Z_PK, ZTYPE, ZSERVICE, ZMANUFACTURERDESCRIPTION, ZFORMAT, "
+        "ZINSTANCEID FROM ZMKFCHARACTERISTIC"
     )
-    for pk, ztype, svc_pk, desc, fmt in cur.fetchall():
+    for pk, ztype, svc_pk, desc, fmt, instance_id in cur.fetchall():
         char_type = None
         if ztype:
             try:
@@ -494,14 +507,19 @@ def _build_characteristic_lookup(
             except Exception:
                 pass
         svc_info = services.get(svc_pk, {})
-        lookup[pk] = {
+        entry = {
             "type": char_type,
             "service": svc_info.get("name", ""),
             "accessory": svc_info.get("accessory", ""),
             "description": desc,
             "format": fmt,
+            "serviceId": svc_pk,
+            "instanceId": instance_id,
         }
-    return lookup
+        by_pk[pk] = entry
+        if svc_pk is not None and instance_id is not None:
+            by_instance[(svc_pk, instance_id)] = entry
+    return by_pk, by_instance
 
 
 # ---------------------------------------------------------------------------
@@ -511,7 +529,7 @@ def _build_characteristic_lookup(
 def _extract_events(
     cur: sqlite3.Cursor,
     trigger_pk: int,
-    char_info: dict[int, dict],
+    chars_by_instance: dict[tuple[int, int], dict],
     svc_names: dict[int, dict],
 ) -> list[dict]:
     """Return a list of decoded event dicts for a given trigger Z_PK."""
@@ -538,11 +556,17 @@ def _extract_events(
             except Exception:
                 pass
         if ev[6]:
-            ci = char_info.get(ev[6], {})
+            # ev[6] is ZCHARACTERISTICID, an instance id scoped to ev[7]
+            # (ZSERVICE) -- not a Z_PK.  See _build_characteristic_lookup.
+            ci = chars_by_instance.get((ev[7], ev[6])) or {}
             evt["characteristic"] = ci.get("description") or ci.get("type", "")
             evt["accessory"] = ci.get("accessory", "")
             evt["service"] = ci.get("service", "")
             evt["format"] = ci.get("format", "")
+            # A multi-button remote exposes one service per button under a
+            # single accessory, so the service id is what tells them apart.
+            evt["serviceId"] = ci.get("serviceId")
+            evt["characteristicInstanceId"] = ci.get("instanceId")
         if ev[7]:
             si = svc_names.get(ev[7], {})
             if not evt.get("accessory"):
@@ -558,7 +582,7 @@ def _extract_events(
 def _extract_actions(
     cur: sqlite3.Cursor,
     action_set_pk: int,
-    char_info: dict[int, dict],
+    chars_by_instance: dict[tuple[int, int], dict],
     acc_names: dict[int, dict],
     svc_names: dict[int, dict],
     verbose: bool = False,
@@ -599,9 +623,12 @@ def _extract_actions(
                 except Exception:
                     pass
             if act_char:
-                ci = char_info.get(act_char, {})
+                # Instance id scoped to act_svc, not a Z_PK.
+                ci = chars_by_instance.get((act_svc, act_char)) or {}
                 ad["characteristic"] = ci.get("description") or ci.get("type", "")
                 ad["format"] = ci.get("format", "")
+                ad["serviceId"] = ci.get("serviceId")
+                ad["characteristicInstanceId"] = ci.get("instanceId")
             if act_acc:
                 ai = acc_names.get(act_acc, {})
                 ad["accessoryName"] = ai.get("name", "")
@@ -648,7 +675,7 @@ def extract(db_path: str, verbose: bool = False) -> dict:
     rooms = _build_room_lookup(cur)
     acc_names = _build_accessory_lookup(cur, rooms)
     svc_names = _build_service_lookup(cur, acc_names)
-    char_info = _build_characteristic_lookup(cur, svc_names)
+    char_info, chars_by_instance = _build_characteristic_lookup(cur, svc_names)
 
     if verbose:
         print(
@@ -710,7 +737,7 @@ def extract(db_path: str, verbose: bool = False) -> dict:
                 pass
 
         # Events (trigger conditions)
-        auto["events"] = _extract_events(cur, t_pk, char_info, svc_names)
+        auto["events"] = _extract_events(cur, t_pk, chars_by_instance, svc_names)
 
         # Action sets via the junction table Z_41TRIGGERS_.
         # Column Z_41ACTIONSETS_  -> ZMKFACTIONSET.Z_PK
@@ -729,7 +756,7 @@ def extract(db_path: str, verbose: bool = False) -> dict:
                 "name": aset_name or "",
                 "type": aset_type or "",
                 "actions": _extract_actions(
-                    cur, aset_pk, char_info, acc_names, svc_names, verbose
+                    cur, aset_pk, chars_by_instance, acc_names, svc_names, verbose
                 ),
             }
             auto["actionSets"].append(asd)
