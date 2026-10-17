@@ -26,9 +26,16 @@ Technical notes (see also the handoff document):
     - CharacteristicWriteAction rows use ZACCESSORY1 (not ZACCESSORY) for the
       device foreign key.  ZACCESSORY is always NULL -- likely a CoreData
       model versioning artifact.
-    - The trigger-to-action-set relationship goes through the junction table
-      Z_41TRIGGERS_ with columns Z_41ACTIONSETS_ and Z_135TRIGGERS_.  The
-      numbers come from CoreData's internal relationship IDs.
+    - The trigger-to-action-set relationship goes through a junction table
+      named after CoreData's internal entity numbers (Z_41TRIGGERS_ with
+      columns Z_41ACTIONSETS_ and Z_135TRIGGERS_ on older macOS, column
+      Z_142TRIGGERS_ on macOS 27).  These numbers, and the Z_ENT values of
+      every action, event and trigger type, change between macOS releases:
+      they are resolved at runtime from Z_PRIMARYKEY and PRAGMA table_info,
+      never hard-coded.  An unrecognised schema stops with exit code 4.
+    - Range events (thresholds) keep their bounds in ZMIN and ZMAX.
+    - Event values, range bounds and characteristic-write target values are
+      binary plists on older macOS and Apple OPACK on macOS 27; both decode.
     - ShortcutAction ZDATA blobs are binary plists containing WFWorkflowActions.
     - Within homeaccessory workflow steps, HMActionSetSerializedData is
       protobuf-encoded (NOT plist).  We decode it with a minimal varint-based
@@ -45,11 +52,13 @@ Technical notes (see also the handoff document):
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import datetime
 import json
 import os
 import plistlib
 import sqlite3
+import struct
 import sys
 import uuid as uuid_mod
 
@@ -60,47 +69,101 @@ import uuid as uuid_mod
 # CoreData epoch: 2001-01-01 00:00:00 UTC expressed as a Unix timestamp.
 COREDATA_EPOCH_OFFSET = 978307200
 
-# Z_ENT values from the Z_PRIMARYKEY table.
-ENT_CHARACTERISTIC_WRITE = 36
-ENT_MATTER_COMMAND = 37
-ENT_MEDIA_PLAYBACK = 38
-ENT_NATURAL_LIGHTING = 39
-ENT_SHORTCUT_ACTION = 40
-
-ENT_CALENDAR_EVENT = 88
-ENT_CHAR_RANGE_EVENT = 90
-ENT_CHAR_VALUE_EVENT = 91
-ENT_DURATION_EVENT = 92
-ENT_LOCATION_EVENT = 93
-ENT_PRESENCE_EVENT = 96
-ENT_SIGNIFICANT_TIME_EVENT = 97
-
-ENT_EVENT_TRIGGER = 136
-ENT_TIMER_TRIGGER = 137
-
-# Friendly names for entity types.
-ACTION_ENT_NAMES = {
-    ENT_CHARACTERISTIC_WRITE: "characteristicWrite",
-    ENT_MATTER_COMMAND: "matterCommand",
-    ENT_MEDIA_PLAYBACK: "mediaPlayback",
-    ENT_NATURAL_LIGHTING: "naturalLighting",
-    ENT_SHORTCUT_ACTION: "shortcut",
+# Friendly names for entity types, keyed by CoreData entity name (Z_PRIMARYKEY.Z_NAME).
+# The Z_ENT numbers themselves differ between macOS releases and are read from the database.
+ACTION_NAMES = {
+    "MKFCharacteristicWriteAction": "characteristicWrite",
+    "MKFMatterCommandAction": "matterCommand",
+    "MKFMediaPlaybackAction": "mediaPlayback",
+    "MKFNaturalLightingAction": "naturalLighting",
+    "MKFShortcutAction": "shortcut",
 }
 
-EVENT_ENT_NAMES = {
-    ENT_CALENDAR_EVENT: "calendar",
-    ENT_CHAR_RANGE_EVENT: "charRange",
-    ENT_CHAR_VALUE_EVENT: "charValue",
-    ENT_DURATION_EVENT: "duration",
-    ENT_LOCATION_EVENT: "location",
-    ENT_PRESENCE_EVENT: "presence",
-    ENT_SIGNIFICANT_TIME_EVENT: "significantTime",
+EVENT_NAMES = {
+    "MKFCalendarEvent": "calendar",
+    "MKFCharacteristicEvent": "characteristic",
+    "MKFCharacteristicRangeEvent": "charRange",
+    "MKFCharacteristicValueEvent": "charValue",
+    "MKFDurationEvent": "duration",
+    "MKFLocationEvent": "location",
+    "MKFMatterAttributeEvent": "matterAttribute",
+    "MKFMatterAttributeValueEvent": "matterAttributeValue",
+    "MKFPresenceEvent": "presence",
+    "MKFSignificantTimeEvent": "significantTime",
 }
 
-TRIGGER_ENT_NAMES = {
-    ENT_EVENT_TRIGGER: "event",
-    ENT_TIMER_TRIGGER: "timer",
+TRIGGER_NAMES = {
+    "MKFEventTrigger": "event",
+    "MKFTimerTrigger": "timer",
 }
+
+# Entities without which the extraction cannot be trusted.
+REQUIRED_ENTITIES = (
+    "MKFActionSet",
+    "MKFTrigger",
+    "MKFEventTrigger",
+    "MKFCharacteristicWriteAction",
+    "MKFShortcutAction",
+)
+
+
+class SchemaError(Exception):
+    """The homed database does not have the structure this script understands."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Schema:
+    """CoreData numbering of one homed database, resolved at runtime."""
+
+    entities: dict[str, int]
+    trigger_junction: tuple[str, str, str]  # (table, action-set column, trigger column)
+    event_columns: frozenset[str]
+
+    def label(self, kind: str, ent: int) -> str:
+        """Friendly name of entity *ent* for *kind* ("action", "event" or "trigger").
+
+        An entity unknown to the database is reported as ``ent_<n>``; an entity the
+        database names but this script does not map, as ``entity:<name>``.  Never a guess.
+        """
+        names = {"action": ACTION_NAMES, "event": EVENT_NAMES, "trigger": TRIGGER_NAMES}[kind]
+        name = next((n for n, e in self.entities.items() if e == ent), None)
+        if name is None:
+            return f"ent_{ent}"
+        return names.get(name, f"entity:{name}")
+
+
+def resolve_schema(cur: sqlite3.Cursor) -> Schema:
+    """Read entity numbers from Z_PRIMARYKEY and find the trigger/action-set junction table."""
+    try:
+        rows = cur.execute("SELECT Z_ENT, Z_NAME FROM Z_PRIMARYKEY").fetchall()
+    except sqlite3.OperationalError as exc:
+        # Only a missing table means "not a homed schema"; an unreadable file stays a database error.
+        if "no such table" not in str(exc):
+            raise
+        raise SchemaError("no Z_PRIMARYKEY table") from exc
+    entities = {name: ent for ent, name in rows if name}
+    missing = [name for name in REQUIRED_ENTITIES if name not in entities]
+    if missing:
+        raise SchemaError("missing entities: " + ", ".join(missing))
+
+    action_set_col = f"Z_{entities['MKFActionSet']}ACTIONSETS_"
+    trigger_col = f"Z_{entities['MKFTrigger']}TRIGGERS_"
+    tables = [r[0] for r in cur.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'Z\\_%' ESCAPE '\\'").fetchall()]
+    candidates = []
+    for table in tables:
+        quoted = table.replace('"', '""')
+        columns = {r[1] for r in cur.execute(f'PRAGMA table_info("{quoted}")').fetchall()}
+        if action_set_col in columns and trigger_col in columns:
+            candidates.append(table)
+    if not candidates:
+        raise SchemaError(f"no junction table with columns {action_set_col} and {trigger_col}")
+    if len(candidates) > 1:
+        raise SchemaError("ambiguous junction tables: " + ", ".join(sorted(candidates)))
+    junction = (candidates[0], action_set_col, trigger_col)
+
+    event_columns = frozenset(r[1] for r in cur.execute("PRAGMA table_info(ZMKFEVENT)").fetchall())
+    return Schema(entities, junction, event_columns)
 
 # WFCondition lookup (Shortcuts conditional operators).
 WF_CONDITIONS = {
@@ -258,6 +321,107 @@ def extract_target_value_from_nsarchiver(data: bytes):
         return make_serializable(plist)
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Value decoding: binary plist (older macOS) or OPACK (macOS 27)
+# ---------------------------------------------------------------------------
+
+def _take(data: bytes, offset: int, size: int) -> bytes:
+    if offset + size > len(data):
+        raise ValueError("truncated OPACK value")
+    return data[offset:offset + size]
+
+
+OPACK_MAX_DEPTH = 32
+
+
+def _decode_opack_at(data: bytes, offset: int, depth: int = 0):
+    """Decode one OPACK object at *offset*; return (value, new_offset).
+
+    Only well-understood tags are decoded; anything else raises ValueError, so the caller keeps the raw bytes.
+    """
+    if depth > OPACK_MAX_DEPTH:
+        raise ValueError("OPACK nesting too deep")
+    tag = _take(data, offset, 1)[0]
+    i = offset + 1
+    if tag == 0x01:
+        return True, i
+    if tag == 0x02:
+        return False, i
+    if tag == 0x04:
+        return None, i
+    if tag == 0x05:
+        return str(uuid_mod.UUID(bytes=_take(data, i, 16))), i + 16
+    if 0x08 <= tag <= 0x2F:
+        return tag - 0x08, i
+    if 0x30 <= tag <= 0x33:
+        size = 1 << (tag - 0x30)
+        return int.from_bytes(_take(data, i, size), "little"), i + size
+    if tag == 0x35:  # float32: trimmed to its 7 significant digits (18.3, not 18.299999237060547)
+        return float(f"{struct.unpack('<f', _take(data, i, 4))[0]:.7g}"), i + 4
+    if tag == 0x36:
+        return struct.unpack("<d", _take(data, i, 8))[0], i + 8
+    if 0x40 <= tag <= 0x64:
+        if tag <= 0x60:
+            size = tag - 0x40
+        else:
+            width = tag - 0x60
+            size = int.from_bytes(_take(data, i, width), "little")
+            i += width
+        return _take(data, i, size).decode("utf-8"), i + size
+    if 0x70 <= tag <= 0x94:
+        if tag <= 0x90:
+            size = tag - 0x70
+        else:
+            width = 1 << (tag - 0x91)
+            size = int.from_bytes(_take(data, i, width), "little")
+            i += width
+        return make_serializable(_take(data, i, size)), i + size
+    if 0xD0 <= tag <= 0xDF:
+        items: list = []
+        while (tag < 0xDF and len(items) < tag - 0xD0) or (tag == 0xDF and _take(data, i, 1)[0] != 0x03):
+            item, i = _decode_opack_at(data, i, depth + 1)
+            items.append(item)
+        return items, (i + 1 if tag == 0xDF else i)
+    if 0xE0 <= tag <= 0xEF:
+        mapping: dict = {}
+        pairs = 0
+        while (tag < 0xEF and pairs < tag - 0xE0) or (tag == 0xEF and _take(data, i, 1)[0] != 0x03):
+            key, i = _decode_opack_at(data, i, depth + 1)
+            value, i = _decode_opack_at(data, i, depth + 1)
+            mapping[str(key)] = value
+            pairs += 1
+        return mapping, (i + 1 if tag == 0xEF else i)
+    raise ValueError(f"unknown OPACK tag 0x{tag:02x}")
+
+
+def decode_opack(data: bytes):
+    """Decode an Apple OPACK value (how macOS 27 stores event, bound and target values)."""
+    value, end = _decode_opack_at(data, 0)
+    if end != len(data):
+        raise ValueError("trailing bytes after OPACK value")
+    return value
+
+
+def decode_value(data: bytes):
+    """Decode a stored value (ZEVENTVALUE, ZMIN / ZMAX, ZTARGETVALUE).
+
+    Older databases use binary plists (possibly NSKeyedArchiver archives); macOS 27 uses OPACK.
+    A value that cannot be decoded is kept as ``opack:<hex>`` / ``bplist:<hex>`` rather than dropped.
+    """
+    if data.startswith(b"bplist"):
+        try:
+            value = plistlib.loads(data)
+        except Exception:
+            return f"bplist:{data.hex()}"
+        if isinstance(value, dict) and "$objects" in value:
+            return extract_target_value_from_nsarchiver(data)
+        return make_serializable(value)
+    try:
+        return make_serializable(decode_opack(data))
+    except (ValueError, IndexError, UnicodeDecodeError, OverflowError, RecursionError, struct.error):
+        return f"opack:{data.hex()}"
 
 
 # ---------------------------------------------------------------------------
@@ -510,22 +674,28 @@ def _build_characteristic_lookup(
 
 def _extract_events(
     cur: sqlite3.Cursor,
+    schema: Schema,
     trigger_pk: int,
     char_info: dict[int, dict],
     svc_names: dict[int, dict],
 ) -> list[dict]:
     """Return a list of decoded event dicts for a given trigger Z_PK."""
+    has_bounds = {"ZMIN", "ZMAX"} <= schema.event_columns
+    bounds = ", e.ZMIN, e.ZMAX" if has_bounds else ", NULL, NULL"
     cur.execute(
         "SELECT e.Z_ENT, e.ZSIGNIFICANTEVENT, e.ZPRESENCETYPE, e.ZOFFSETSECONDS, "
-        "e.ZDURATION, e.ZEVENTVALUE, e.ZCHARACTERISTICID, e.ZSERVICE "
+        "e.ZDURATION, e.ZEVENTVALUE, e.ZCHARACTERISTICID, e.ZSERVICE" + bounds + " "
         "FROM ZMKFEVENT e WHERE e.ZTRIGGER = ?",
         (trigger_pk,),
     )
     events: list[dict] = []
     for ev in cur.fetchall():
         evt: dict = {
-            "eventType": EVENT_ENT_NAMES.get(ev[0], f"ent_{ev[0]}")
+            "eventType": schema.label("event", ev[0])
         }
+        for column, key in ((8, "minimum"), (9, "maximum")):
+            if ev[column] is not None:
+                evt[key] = decode_value(ev[column])
         if ev[1]:
             evt["significantEvent"] = ev[1]
         if ev[2] is not None:
@@ -533,10 +703,7 @@ def _extract_events(
         if ev[3] is not None:
             evt["offsetSeconds"] = ev[3]
         if ev[5]:
-            try:
-                evt["eventValue"] = make_serializable(plistlib.loads(ev[5]))
-            except Exception:
-                pass
+            evt["eventValue"] = decode_value(ev[5])
         if ev[6]:
             ci = char_info.get(ev[6], {})
             evt["characteristic"] = ci.get("description") or ci.get("type", "")
@@ -557,6 +724,7 @@ def _extract_events(
 
 def _extract_actions(
     cur: sqlite3.Cursor,
+    schema: Schema,
     action_set_pk: int,
     char_info: dict[int, dict],
     acc_names: dict[int, dict],
@@ -578,7 +746,7 @@ def _extract_actions(
     )
     actions: list[dict] = []
     for act_pk, act_ent, act_data, act_target, act_char, act_acc, act_svc in cur.fetchall():
-        atype = ACTION_ENT_NAMES.get(act_ent, f"ent_{act_ent}")
+        atype = schema.label("action", act_ent)
         ad: dict = {"actionType": atype}
 
         if atype == "shortcut" and act_data:
@@ -594,10 +762,7 @@ def _extract_actions(
 
         elif atype == "characteristicWrite":
             if act_target:
-                try:
-                    ad["targetValue"] = make_serializable(plistlib.loads(act_target))
-                except Exception:
-                    pass
+                ad["targetValue"] = decode_value(act_target)
             if act_char:
                 ci = char_info.get(act_char, {})
                 ad["characteristic"] = ci.get("description") or ci.get("type", "")
@@ -640,6 +805,13 @@ def extract(db_path: str, verbose: bool = False) -> dict:
             ) from exc
         raise
     cur = conn.cursor()
+
+    # -- Resolve this database's CoreData numbering --------------------------
+    try:
+        schema = resolve_schema(cur)
+    except SchemaError:
+        conn.close()
+        raise
 
     # -- Build lookup tables ------------------------------------------------
     if verbose:
@@ -687,7 +859,7 @@ def extract(db_path: str, verbose: bool = False) -> dict:
         auto: dict = {
             "name": t_cname or t_name,
             "enabled": bool(t_active),
-            "triggerType": TRIGGER_ENT_NAMES.get(t_ent, f"type_{t_ent}"),
+            "triggerType": schema.label("trigger", t_ent),
         }
 
         if t_eval:
@@ -710,16 +882,16 @@ def extract(db_path: str, verbose: bool = False) -> dict:
                 pass
 
         # Events (trigger conditions)
-        auto["events"] = _extract_events(cur, t_pk, char_info, svc_names)
+        auto["events"] = _extract_events(cur, schema, t_pk, char_info, svc_names)
 
-        # Action sets via the junction table Z_41TRIGGERS_.
-        # Column Z_41ACTIONSETS_  -> ZMKFACTIONSET.Z_PK
-        # Column Z_135TRIGGERS_   -> ZMKFTRIGGER.Z_PK
+        # Action sets via the junction table resolved by resolve_schema():
+        # its action-set column -> ZMKFACTIONSET.Z_PK, its trigger column -> ZMKFTRIGGER.Z_PK.
+        junction, action_set_col, trigger_col = schema.trigger_junction
         cur.execute(
             "SELECT aset.Z_PK, aset.ZNAME, aset.ZTYPE "
-            "FROM Z_41TRIGGERS_ jt "
-            "JOIN ZMKFACTIONSET aset ON jt.Z_41ACTIONSETS_ = aset.Z_PK "
-            "WHERE jt.Z_135TRIGGERS_ = ?",
+            f'FROM "{junction}" jt '
+            f'JOIN ZMKFACTIONSET aset ON jt."{action_set_col}" = aset.Z_PK '
+            f'WHERE jt."{trigger_col}" = ?',
             (t_pk,),
         )
 
@@ -729,7 +901,7 @@ def extract(db_path: str, verbose: bool = False) -> dict:
                 "name": aset_name or "",
                 "type": aset_type or "",
                 "actions": _extract_actions(
-                    cur, aset_pk, char_info, acc_names, svc_names, verbose
+                    cur, schema, aset_pk, char_info, acc_names, svc_names, verbose
                 ),
             }
             auto["actionSets"].append(asd)
@@ -846,6 +1018,9 @@ def main() -> None:
     except PermissionError as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         sys.exit(2)
+    except SchemaError as exc:
+        print(f"[ERROR] Unsupported homed schema: {exc}", file=sys.stderr)
+        sys.exit(4)
     except sqlite3.DatabaseError as exc:
         print(f"[ERROR] Database error: {exc}", file=sys.stderr)
         sys.exit(3)
