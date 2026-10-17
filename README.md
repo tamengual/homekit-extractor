@@ -200,7 +200,7 @@ The merged JSON output contains every automation with full detail:
 
 1. **`ZACCESSORY1`, not `ZACCESSORY`** — All 1,161 CharacteristicWriteAction rows have NULL in `ZACCESSORY` but valid FKs in `ZACCESSORY1`. CoreData versioning artifact.
 
-2. **Junction table naming** — The trigger↔actionset relationship uses `Z_41TRIGGERS_` with columns `Z_41ACTIONSETS_` and `Z_135TRIGGERS_`. These numbers are CoreData's internal relationship IDs.
+2. **Junction table naming** — The trigger↔actionset relationship uses `Z_41TRIGGERS_` with columns `Z_41ACTIONSETS_` and `Z_135TRIGGERS_`. These numbers are CoreData's internal relationship IDs. They change between macOS releases (`Z_142TRIGGERS_` and different `Z_ENT` values on macOS 27), so `homed_extract.py` resolves them at runtime from `Z_PRIMARYKEY` and `PRAGMA table_info`. On macOS 27 the stored values (event values, range bounds, target values) are Apple OPACK instead of binary plists; both are decoded, an undecodable value is kept as `opack:<hex>`, and an unrecognised schema stops the script with exit code 4.
 
 3. **Three layers of encoding** for Shortcut device actions:
    - Layer 1: Binary plist (`ZDATA` → `WFWorkflowActions`)
