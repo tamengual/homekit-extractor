@@ -29,7 +29,13 @@ from homekit_to_ha import (
     _summarize_ha_actions,
     simulate_output,
     _normalize_automation,
+    to_yaml,
 )
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 
 class TestInferDomainFromService(unittest.TestCase):
@@ -845,6 +851,53 @@ class TestSimulateOutput(unittest.TestCase):
         self.assertIn("PLACEHOLDER_TRIGGER", output)
         self.assertIn("ALL_TODO_ACTIONS", output)
         self.assertIn("HIGH", output)  # Risk should be HIGH
+
+
+class TestToYaml(unittest.TestCase):
+    """Test that YAML output quotes strings so it parses back unchanged."""
+
+    NAME = "[HK] Kid's Lamp"
+
+    def _automation(self):
+        return {
+            "id": "hk_test",
+            "alias": self.NAME,
+            "description": "Converted from HomeKit automation 'Kid's Lamp'",
+            "mode": "single",
+            "triggers": [{
+                "_comment": "# TODO: Verify entity_id for 'Kid's\nLamp'",
+                "platform": "state",
+                "entity_id": "# TODO: Map entity for 'Kid's Lamp'",
+                "to": "off",
+            }],
+            "actions": [{
+                "service": "light.turn_on",
+                "target": {"entity_id": "light.kids_lamp"},
+                "data": {"effect": "yes", "rgb_color": [255, "no", 0]},
+            }],
+        }
+
+    def test_strings_are_double_quoted_and_escaped(self):
+        lines = to_yaml([self._automation()]).splitlines()
+        self.assertIn('  alias: "[HK] Kid\'s Lamp"', lines)
+        self.assertIn('  description: "Converted from HomeKit automation \'Kid\'s Lamp\'"', lines)
+        self.assertIn('    to: "off"', lines)
+        self.assertIn('    entity_id: "# TODO: Map entity for \'Kid\'s Lamp\'"', lines)
+        self.assertIn('        rgb_color: [255, "no", 0]', lines)
+        # Comment with an embedded newline stays a single comment line
+        self.assertIn("  # TODO: Verify entity_id for 'Kid's Lamp'", lines)
+
+    @unittest.skipUnless(yaml, "PyYAML not installed")
+    def test_output_round_trips_through_pyyaml(self):
+        parsed = yaml.safe_load(to_yaml([self._automation()]))
+        self.assertEqual(len(parsed), 1)
+        auto = parsed[0]
+        self.assertEqual(auto["alias"], self.NAME)
+        self.assertEqual(auto["description"], "Converted from HomeKit automation 'Kid's Lamp'")
+        trigger = auto["triggers"][0]
+        self.assertEqual(trigger["to"], "off")
+        self.assertEqual(trigger["entity_id"], "# TODO: Map entity for 'Kid's Lamp'")
+        self.assertEqual(auto["actions"][0]["data"], {"effect": "yes", "rgb_color": [255, "no", 0]})
 
 
 if __name__ == "__main__":

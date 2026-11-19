@@ -1022,8 +1022,8 @@ def to_yaml(automations):
 
     for auto in automations:
         lines.append(f"- id: {auto['id']}")
-        lines.append(f"  alias: '{auto['alias']}'")
-        lines.append(f"  description: '{auto['description']}'")
+        lines.append(f"  alias: {format_yaml_value(auto['alias'])}")
+        lines.append(f"  description: {format_yaml_value(auto['description'])}")
         lines.append(f"  mode: {auto['mode']}")
 
         # Triggers
@@ -1031,7 +1031,7 @@ def to_yaml(automations):
         for trigger in auto.get("triggers", []):
             comment = trigger.pop("_comment", None)
             if comment:
-                lines.append(f"  {comment}")
+                lines.append(f"  {one_line(comment)}")
             lines.append(f"  - platform: {trigger.get('platform', 'event')}")
             for k, v in trigger.items():
                 if k == "platform":
@@ -1061,7 +1061,7 @@ def render_actions(actions, lines, indent=2):
 
     for action in actions:
         if "_comment" in action and len(action) == 1:
-            lines.append(f"{prefix}{action['_comment']}")
+            lines.append(f"{prefix}{one_line(action['_comment'])}")
             continue
 
         if "choose" in action:
@@ -1083,7 +1083,7 @@ def render_actions(actions, lines, indent=2):
 
         comment = action.pop("_comment", None) if isinstance(action, dict) else None
         if comment:
-            lines.append(f"{prefix}{comment}")
+            lines.append(f"{prefix}{one_line(comment)}")
 
         if "service" in action:
             lines.append(f"{prefix}- service: {action['service']}")
@@ -1102,12 +1102,17 @@ def format_yaml_value(value):
     if isinstance(value, bool):
         return "'on'" if value else "'off'"
     if isinstance(value, str):
-        if value.startswith("#"):
-            return f"'{value}'"
-        return f"'{value}'" if any(c in value for c in ":#{}[]|>&*!%@") else value
+        # JSON strings are valid YAML double-quoted scalars: escapes quotes and
+        # newlines, and keeps on/off/yes/no/null/"123" from becoming non-strings.
+        return json.dumps(value, ensure_ascii=False)
     if isinstance(value, (list, tuple)):
-        return f"[{', '.join(str(v) for v in value)}]"
+        return f"[{', '.join(format_yaml_value(v) for v in value)}]"
     return str(value)
+
+
+def one_line(comment):
+    """Collapse a comment to one line so embedded newlines can't inject YAML."""
+    return " ".join(str(comment).splitlines())
 
 
 def main():
