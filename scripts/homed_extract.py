@@ -426,6 +426,16 @@ def decode_shortcut_workflow(data: bytes) -> list[dict]:
             if "WFMenuItemTitle" in params:
                 s["menuItemTitle"] = make_serializable(params["WFMenuItemTitle"])
 
+        else:
+            # Keep scalar parameters (e.g. WFDelayTime, WFRepeatCount) of other steps.
+            scalars = {
+                k: v for k, v in params.items()
+                if isinstance(v, (bool, int, float, str))
+                and k not in ("UUID", "GroupingIdentifier")
+            }
+            if scalars:
+                s["params"] = scalars
+
         steps.append(s)
     return steps
 
